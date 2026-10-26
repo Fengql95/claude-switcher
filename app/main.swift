@@ -20,6 +20,11 @@ struct CoreResult {
     let succeeded: Bool
 }
 
+struct AccountStamp: Equatable {
+    let size: String
+    let date: String
+}
+
 // 超时回调与 waitUntilExit 在不同队列上执行。
 private final class ProcessDeadline {
     private let lock = NSLock()
@@ -59,8 +64,8 @@ final class VM: ObservableObject {
     ]
     @Published var phase: Phase = .checking
     @Published var current = "?"
-    @Published var hasA = false
-    @Published var hasB = false
+    @Published var archived: Set<String> = []
+    @Published var stamps: [String: AccountStamp] = [:]
     @Published var banner = ""
     @Published var note = ""
     @Published var fingerprint = ""
@@ -68,6 +73,7 @@ final class VM: ObservableObject {
     @Published private(set) var lastCheckSummary = "尚未检查"
     @Published var updateText = ""
     @Published var showUpdateSheet = false
+    @Published private(set) var coreMissing = false
 
     let core: String
     private let checkTimeout: TimeInterval
@@ -141,8 +147,24 @@ final class VM: ObservableObject {
     func refresh() {
         guard !isBusy else { return }
         hideAfterSwitch?.cancel()
+        if !coreAvailable() { markCoreMissing(); return }
         isBusy = true
         checkEnvironment { _ in self.isBusy = false }
+    }
+
+    private func coreAvailable() -> Bool {
+        FileManager.default.isReadableFile(atPath: core)
+    }
+
+    private func markCoreMissing() {
+        coreMissing = true
+        phase = .failed
+        lastCheckSummary = "未安装核心脚本"
+        banner = "未安装核心脚本：请下载 installer-kit 安装包并双击 installer/安装.command，或运行源码安装"
+        for i in rows.indices {
+            rows[i].state = .fail
+            rows[i].detail = "未安装核心脚本"
+        }
     }
 
     func refreshAccountStatus() {
@@ -156,6 +178,12 @@ final class VM: ObservableObject {
     }
 
     private func checkEnvironment(done: @escaping (Bool) -> Void) {
+        if !coreAvailable() {
+            markCoreMissing()
+            done(false)
+            return
+        }
+        coreMissing = false
         phase = .checking
         lastCheckSummary = "检查中"
         banner = ""
@@ -187,7 +215,11 @@ final class VM: ObservableObject {
                 self.rows[idx].detail = status.count > 1 ? status[1] : ""
             }
             if !result.succeeded {
-                self.banner = result.output
+                self.banner = result.output.isEmpty ? "核心脚本执行失败" : result.output
+                for i in self.rows.indices where self.rows[i].state == .pending {
+                    self.rows[i].state = .fail
+                    self.rows[i].detail = "核心脚本执行失败"
+                }
             } else if duplicated {
                 self.banner = "检测输出存在重复项，请重新检查"
             } else if matched.count != self.rows.count {
@@ -198,7 +230,9 @@ final class VM: ObservableObject {
             self.run(["status"], timeout: self.checkTimeout) { status in
                 let statusOK = self.updateStatus(status)
                 if !statusOK {
-                    self.banner = "无法读取账号状态，请重新检查"
+                    if !passed || self.banner.isEmpty {
+                        self.banner = "无法读取账号状态，请重新检查"
+                    }
                     self.lastCheckSummary = "失败"
                 }
                 self.phase = passed && statusOK ? .ready : .failed
@@ -213,18 +247,48 @@ final class VM: ObservableObject {
             let pair = field.split(separator: "=", maxSplits: 1).map(String.init)
             if pair.count == 2 { values[pair[0]] = pair[1] }
         }
-        guard result.succeeded, let account = fields["current"], ["A", "B", "none"].contains(account),
-              let a = fields["hasA"], let b = fields["hasB"], ["0", "1"].contains(a), ["0", "1"].contains(b) else {
-            current = "未知"; hasA = false; hasB = false
+        func reset() -> Bool {
+            current = "未知"; archived = []; stamps = [:]
             return false
         }
+        guard result.succeeded, let account = fields["current"],
+              ["A", "B", "C", "D", "none"].contains(account) else {
+            return reset()
+        }
+        var known = Set<String>()
+        if let list = fields["accounts"] {
+            if list != "none" {
+                for piece in list.split(separator: ",", omittingEmptySubsequences: true) {
+                    let letter = String(piece)
+                    guard Self.accountLetters.contains(letter) else { return reset() }
+                    known.insert(letter)
+                }
+            }
+        } else {
+            // 旧版核心只输出 current/hasA/hasB,继续兼容已安装的旧脚本。
+            for letter in ["A", "B"] {
+                guard let flag = fields["has\(letter)"], ["0", "1"].contains(flag) else { return reset() }
+                if flag == "1" { known.insert(letter) }
+            }
+        }
+        var parsed: [String: AccountStamp] = [:]
+        for letter in Self.accountLetters {
+            guard let raw = fields["acc\(letter)"] else { continue }
+            let parts = raw.split(separator: "@", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return reset() }
+            parsed[letter] = AccountStamp(size: String(parts[0]), date: String(parts[1]))
+        }
         current = account == "none" ? "未初始化" : account
-        hasA = a == "1"; hasB = b == "1"
+        stamps = parsed
+        archived = known
         return true
     }
 
+    static let accountLetters = ["A", "B", "C", "D"]
+
     func fixAll() {
         guard !isBusy else { return }
+        guard coreAvailable() else { markCoreMissing(); return }
         hideAfterSwitch?.cancel()
         isBusy = true
         phase = .fixing
@@ -284,7 +348,7 @@ final class VM: ObservableObject {
     }
 
     func switchTo(_ target: String) {
-        guard !isBusy, ["A", "B"].contains(target) else { return }
+        guard !isBusy, Self.accountLetters.contains(target) else { return }
         hideAfterSwitch?.cancel()
         isBusy = true
         switchRequested = true
@@ -312,7 +376,9 @@ final class VM: ObservableObject {
                 return
             }
             var extra = ""
-            if target == "B" && !self.hasB { extra = "B 号首次使用：请在打开的 Claude 里登录 B 账号，登录一次即可。" }
+            if target != "A" && !self.archived.contains(target) {
+                extra = "\(target) 号首次使用：请在打开的 Claude 里登录 \(target) 账号，登录一次即可。"
+            }
             let unchanged = lines.contains { $0.hasPrefix("INFO:") }
             if unchanged { extra = "" }
             self.current = target
@@ -335,7 +401,7 @@ final class VM: ObservableObject {
 
 struct ContentView: View {
     @ObservedObject var vm: VM
-    var height: CGFloat = 860
+    var height: CGFloat = 900
     @State private var showNotice = false
     @State private var showFingerprint = false
     @State private var showAIPrompt = false
@@ -346,13 +412,20 @@ struct ContentView: View {
                            startPoint: .top, endPoint: .bottom).ignoresSafeArea()
             VStack(spacing: 16) {
                 header
-                checksCard
-                if vm.phase == .ready || vm.phase == .switching || vm.phase == .done {
-                    accountCard
-                } else if vm.phase == .failed || vm.phase == .fixing {
-                    retryCard
+                // 小屏上窗口高度会被系统可见区域压缩,让卡片区可滚动而不是被裁切
+                ScrollView {
+                    VStack(spacing: 16) {
+                        checksCard
+                        if vm.phase == .ready || vm.phase == .switching || vm.phase == .done {
+                            accountCard
+                        } else if vm.coreMissing {
+                            setupCard
+                        } else if vm.phase == .failed || vm.phase == .fixing {
+                            retryCard
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
                 }
-                Spacer(minLength: 0)
                 footer
             }
             .padding(20)
@@ -475,9 +548,10 @@ struct ContentView: View {
                         .clipShape(Capsule())
                     Spacer()
                 }
-                HStack(spacing: 10) {
-                    accountButton("A", subtitle: vm.current == "A" ? "当前" : (vm.hasA ? "已建档" : "未初始化"))
-                    accountButton("B", subtitle: vm.current == "B" ? "当前" : (vm.hasB ? "已建档" : "未初始化"))
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                    ForEach(VM.accountLetters, id: \.self) { t in
+                        accountButton(t, subtitle: accountSubtitle(t))
+                    }
                 }
             }
         }
@@ -485,6 +559,19 @@ struct ContentView: View {
         .background(Color.white.opacity(0.05))
         .clipShape(RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.white.opacity(0.08)))
+    }
+
+    func accountSubtitle(_ t: String) -> String {
+        if vm.current == t { return "当前" }
+        guard vm.archived.contains(t) else { return "未初始化" }
+        guard let stamp = vm.stamps[t] else { return "已建档" }
+        return "已建档 · \(stamp.size) · \(shortDate(stamp.date))"
+    }
+
+    func shortDate(_ value: String) -> String {
+        let parts = value.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0].count == 4 else { return value }
+        return "\(parts[1])-\(parts[2])"
     }
 
     func accountButton(_ t: String, subtitle: String) -> some View {
@@ -504,6 +591,42 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .disabled(vm.isBusy)
+    }
+
+    var setupCard: some View {
+        VStack(spacing: 10) {
+            Text("还差一步：安装核心脚本").font(.callout.bold()).foregroundColor(.white)
+            Text(vm.banner).font(.caption).foregroundColor(.white.opacity(0.7)).multilineTextAlignment(.center)
+            HStack(spacing: 10) {
+                Button { openURL("https://github.com/YOURSJEYO/claude-switcher/releases/latest") } label: {
+                    Label("打开下载页", systemImage: "arrow.down.circle")
+                        .font(.callout.bold())
+                        .padding(.horizontal, 18).padding(.vertical, 8)
+                        .background(LinearGradient(colors: [Color.indigo, Color.purple], startPoint: .leading, endPoint: .trailing))
+                        .foregroundColor(.white)
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                Button { openURL("https://github.com/YOURSJEYO/claude-switcher#安装") } label: {
+                    Label("安装说明", systemImage: "book")
+                        .font(.callout.bold())
+                        .padding(.horizontal, 18).padding(.vertical, 8)
+                        .background(Color.white.opacity(0.1))
+                        .foregroundColor(.white)
+                        .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity)
+        .background(Color.red.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.red.opacity(0.25)))
+    }
+
+    private func openURL(_ text: String) {
+        if let url = URL(string: text) { NSWorkspace.shared.open(url) }
     }
 
     var retryCard: some View {
@@ -836,7 +959,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if mainWindow == nil {
             let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable]
             let titleHeight = NSWindow.frameRect(forContentRect: .zero, styleMask: style).height
-            let height = min(CGFloat(860), (NSScreen.main?.visibleFrame.height ?? 900) - titleHeight)
+            let height = min(CGFloat(900), (NSScreen.main?.visibleFrame.height ?? 900) - titleHeight)
             let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 440, height: height),
                 styleMask: style,

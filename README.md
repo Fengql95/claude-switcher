@@ -110,7 +110,7 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 到 [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest) 下载最新版本，按用途选择：
 
 - `ClaudeSwitcher-<版本>-installer-kit.zip`：**首次安装推荐**。解压后双击 `installer/安装.command`，安装核心脚本、守护进程与桌面 App。
-- `ClaudeSwitcher-<版本>-macos-arm64.dmg` / `.zip`：仅包含 macOS 界面 App；核心脚本已安装时可用于替换旧版界面。
+- `ClaudeSwitcher-<版本>-macos-arm64-app-only.dmg` / `.zip`：**仅包含界面 App**（不含核心脚本）；已安装核心脚本时可用于替换旧版界面。首次安装请用上面的 installer-kit。
 - `ClaudeSwitcher-<版本>-windows.zip` / `ClaudeSwitcher-<版本>-linux.tar.gz`：Windows / Linux 脚本包（Beta），说明见各自目录的 README。
 
 > macOS 产物为 ad-hoc 签名、未公证。首次打开若被 Gatekeeper 拦截，请右键打开，或在「系统设置 → 隐私与安全性」中放行。每个 Release 附带 `SHA256SUMS-release.txt`，可用 `shasum -a 256 -c` 校验下载文件。
@@ -142,14 +142,14 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 1. 双击桌面「Claude切换器」→ 等待 14 项检查
 2. 全绿 → 选账号启动；有红项 → 「一键修复」自动处理
-3. B 账号首次使用登录一次，以后 A/B 随切随用、互不干扰
+3. B/C/D 账号首次使用登录一次，以后 A–D 随切随用、互不干扰
 4. 换了其他国家的节点 → 跑一次 `~/.local/bin/claude-switch.sh set-region`，国家/时区/地区格式一键重新锁定
 
 ### macOS 菜单栏常驻
 
 启动后，顶部菜单栏会显示盾牌图标，Dock 不显示应用图标。首次启动自动打开主窗口；关闭窗口或切换账号成功后只隐藏窗口，仍可从盾牌菜单重新打开。
 
-- 菜单显示当前账号和「最近检查」结果（通过 / 有警告 / 失败 / 检查中），提供「打开主窗口」「重新检查」「退出 Claude 切换器」。A/B 切换仍在主窗口完成。
+- 菜单显示当前账号和「最近检查」结果（通过 / 有警告 / 失败 / 检查中），提供「打开主窗口」「重新检查」「退出 Claude 切换器」。A–D 切换仍在主窗口完成。
 - 启动时检查一次；隐藏期间不轮询网络，展开菜单只读取本地账号状态。每次切换账号前会重新完成全部环境检查，检查失败、超时或输出不完整时不会执行切换；警告沿用现有放行规则。
 - 检查、修复、切换和指纹体检期间不会重复执行操作；修复或账号切换期间暂时不能退出。操作结束后可从菜单明确退出。
 - 退出切换器不会卸载或停止独立的保镖、时区看门狗和自动更新服务。应用本身不会因此新增登录自启动。
@@ -157,6 +157,45 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 已安装的旧版 GUI 需要重新编译（或重新运行安装器）才会获得菜单栏功能；现有 `update` 命令仅更新核心脚本，不会替换 GUI。
 
 开发者可在 macOS 上运行 `python3 -m unittest discover -s tests -v`，其中菜单栏模型测试使用假核心脚本，不访问真实账号或网络。隔离 UI 验证方法见 [tests/MENU-BAR-TESTING.md](tests/MENU-BAR-TESTING.md)。
+
+## 多账号（A–D）
+
+除 A/B 外，还支持 C、D 两个账号槽位，最多同时保留四份互不干扰的登录态。
+
+- **创建**：在账号卡片里点击「账号 C」或「账号 D」的空槽位即可。首次使用会在 Claude 里看到登录页，登录一次后该槽位自动成为该账号的独立身份。
+- **卡片含义**：
+  - `当前`：切换器正在使用的账号
+  - `已建档 · 1.2G · 10-20`：该槽位已有独立快照，附带快照体积与最后归档日期
+  - `未初始化`：空槽位，点击后创建新身份
+- **快照位置**：`~/.claude-switcher/accounts/<A|B|C|D>/`。切换时当前账号会先归档到对应目录，再把目标账号还原到 `~/Library/Application Support/Claude`；四个目录彼此独立，互不覆盖。
+- **CLI**：`~/.local/bin/claude-switch.sh switch A|B|C|D`。账号参数只接受 A–D，其他值会输出 `FAIL:` 并拒绝切换。
+- **状态**：`claude-switch.sh status` 在原有 `current/hasA/hasB` 字段外新增 `hasC/hasD`、`accounts=A,B,C`（无归档时为 `none`）与 `accA=<大小>@<日期>`；旧版界面仍可读取前两组字段。
+- 加密导出/导入同样支持 C/D：`snapshot-export <A|B|C|D> <file>` / `snapshot-import <file> <A|B|C|D>`。
+
+## 跨身份保留（可选）
+
+默认关闭。切换账号时，每个账号的数据目录整体替换，因此 `settings.json`、`skills/` 这类想沿用的小文件不会自动带过去。需要共享时，创建：
+
+```text
+~/.claude-switcher/keep-in-workspace.txt
+```
+
+每行写一个**相对于 Claude 数据目录**的路径，`#` 开头为注释、空行忽略：
+
+```text
+# 只保留通用设置与自定义技能
+settings.json
+skills/
+```
+
+行为：
+
+- 切换时先把这些路径收进 `~/.claude-switcher/keep-stage/`，归档当前账号、还原目标账号后再合并回去；首次运行收编为账号 A 时同样生效。
+- 路径必须是相对路径，不能包含 `..`，也不能是符号链接；绝对路径、越界路径和符号链接会跳过并在 `~/Library/Logs/claude-switch.log` 记 `WARN`。
+- 文件不存在或为空时，切换行为与未启用该功能完全一致。
+- 暂存或还原失败会中止切换（不会打开 Claude），还原失败时暂存目录会保留供排查；下次重试同一账号会再次尝试合并。若暂存目录已存在，切换到其他账号会拒绝覆盖，避免丢掉唯一副本。
+
+**风险提示**：跨身份保留意味着这些文件会成为多个账号之间的共同特征。不要放登录凭证、Cookie、设备标识、缓存或任何账号专属数据；只共享自己确认无关联风险的内容。默认关闭是有意为之。
 
 ## Web 版环境检测（零安装）
 
