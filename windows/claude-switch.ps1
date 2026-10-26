@@ -1,5 +1,5 @@
 ﻿# Claude 账号切换器 - Windows 核心脚本
-# 用法: powershell -NoProfile -File claude-switch.ps1 check|status|switch A|B|checkdetail|fix
+# 用法: powershell -NoProfile -File claude-switch.ps1 check|status|switch A|B|checkdetail|fix|check-update|update-now
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
@@ -18,9 +18,82 @@ $CLASH_DIR = @(
     (Join-Path $env:LOCALAPPDATA "io.github.clash-verge-rev.clash-verge-rev")
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $CLASH_DIR) { $CLASH_DIR = Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev" }
-New-Item -ItemType Directory -Force -Path "$BASE\accounts" | Out-Null
+# check-update 必须只读:不在检查路径上创建任何目录
+if ($args.Count -eq 0 -or $args[0] -ne 'check-update') {
+    New-Item -ItemType Directory -Force -Path "$BASE\accounts" | Out-Null
+}
 
 function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Out-File -Append -Encoding utf8 $LOG }
+
+# 当前安装版本(安装器/更新器写入 version.txt,缺失视为 unknown)
+function Get-AppVersion {
+    $vf = Join-Path $BASE "version.txt"
+    if (Test-Path -LiteralPath $vf) {
+        try {
+            $raw = Get-Content -LiteralPath $vf -Raw -ErrorAction Stop
+            if ($null -ne $raw) {
+                $v = ([string]$raw).Trim()
+                if ($v) { return $v }
+            }
+        } catch {}
+    }
+    return 'unknown'
+}
+
+# 版本号按 . 分段比较,每段只取前导数字(忽略 -beta 等后缀);unknown 视为最旧
+function ConvertTo-VersionParts([string]$v) {
+    if ([string]::IsNullOrWhiteSpace($v)) { return @() }
+    $clean = $v.Trim().TrimStart('v', 'V')
+    if ($clean -eq 'unknown') { return @() }
+    return @($clean.Split('.'))
+}
+
+function Compare-Version([string]$a, [string]$b) {
+    $pa = @(ConvertTo-VersionParts $a)
+    $pb = @(ConvertTo-VersionParts $b)
+    $ua = ($pa.Count -eq 0)
+    $ub = ($pb.Count -eq 0)
+    if ($ua -and $ub) { return 0 }
+    if ($ua) { return -1 }
+    if ($ub) { return 1 }
+    $n = [Math]::Max($pa.Count, $pb.Count)
+    for ($i = 0; $i -lt $n; $i++) {
+        $na = 0; $nb = 0
+        if ($i -lt $pa.Count) {
+            $m = [regex]::Match([string]$pa[$i], '^\d+')
+            if ($m.Success) { $na = [int64]$m.Value }
+        }
+        if ($i -lt $pb.Count) {
+            $m = [regex]::Match([string]$pb[$i], '^\d+')
+            if ($m.Success) { $nb = [int64]$m.Value }
+        }
+        if ($na -lt $nb) { return -1 }
+        if ($na -gt $nb) { return 1 }
+    }
+    return 0
+}
+
+# 只允许从 GitHub 官方域名下载更新资产
+function Test-GitHubDownloadUrl([string]$url) {
+    if ([string]::IsNullOrWhiteSpace($url)) { return $false }
+    try { $u = [Uri]$url } catch { return $false }
+    if ($u.Scheme -ne 'https') { return $false }
+    $allowed = @('github.com', 'api.github.com', 'objects.githubusercontent.com',
+                 'github-releases.githubusercontent.com', 'codeload.github.com')
+    return ($allowed -contains $u.Host.ToLowerInvariant())
+}
+
+function Get-ScriptConfigValue([string]$text, [string]$name) {
+    $m = [regex]::Match($text, '(?m)^[ \t]*\$' + [regex]::Escape($name) + '[ \t]*=[ \t]*"([^"]*)"')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return $null
+}
+
+function Set-ScriptConfigValue([string]$text, [string]$name, [string]$value) {
+    $pattern = '(?m)^([ \t]*\$' + [regex]::Escape($name) + '[ \t]*=[ \t]*")[^"]*(")'
+    $replacement = '${1}' + $value.Replace('$', '$$') + '${2}'
+    return [regex]::Replace($text, $pattern, $replacement)
+}
 
 # 代理客户端显示名(供检查细节输出)
 function Get-ProxyName {
@@ -361,14 +434,187 @@ function Invoke-Switch($target) {
     "OK:已切换到账号$target"
 }
 
+function Get-ReleaseInfo {
+    $current = Get-AppVersion
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        # GitHub 要求 User-Agent;PowerShell 5.1 的 -Headers 不允许改它,-UserAgent 等价写入请求头
+        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/YOURSJEYO/claude-switcher/releases/latest' -UserAgent 'ClaudeSwitcher' -TimeoutSec 8
+        $latest = ([string]$rel.tag_name).Trim() -replace '^[vV]', ''
+        if (-not $latest) { throw '无法解析最新版本号' }
+
+        $zip = @($rel.assets) | Where-Object { $_ -and $_.name -like '*-windows.zip' } | Select-Object -First 1
+        $sums = @($rel.assets) | Where-Object { $_ -and $_.name -eq 'SHA256SUMS-release.txt' } | Select-Object -First 1
+        $zipUrl = if ($zip) { [string]$zip.browser_download_url } else { '' }
+        $sumsUrl = if ($sums) { [string]$sums.browser_download_url } else { '' }
+        $pageUrl = [string]$rel.html_url
+        $status = if ((Compare-Version $latest $current) -gt 0) { 'update_available' } else { 'latest' }
+
+        if ($status -eq 'update_available' -and (-not (Test-GitHubDownloadUrl $zipUrl) -or -not (Test-GitHubDownloadUrl $sumsUrl))) {
+            return @{ status = 'error'; current = $current; latest = $latest; zip = ''; sums = ''; page = ''; message = '更新资产缺失或下载地址不是 GitHub 官方域名' }
+        }
+        return @{ status = $status; current = $current; latest = $latest; zip = $zipUrl; sums = $sumsUrl; page = $pageUrl; message = '' }
+    } catch {
+        $msg = ([string]$_.Exception.Message) -replace '\r?\n', ' '
+        if ($msg -match 'rate limit|API rate|403') { $msg = 'GitHub 接口限流，请稍后再试' }
+        return @{ status = 'error'; current = $current; latest = ''; zip = ''; sums = ''; page = ''; message = $msg }
+    }
+}
+
+function Write-ReleaseInfo($info) {
+    switch ($info.status) {
+        'update_available' {
+            "STATUS=update_available"
+            "CURRENT=$($info.current)"
+            "LATEST=$($info.latest)"
+            "ZIP_URL=$($info.zip)"
+            "SUMS_URL=$($info.sums)"
+            "PAGE_URL=$($info.page)"
+        }
+        'latest' {
+            "STATUS=latest"
+            "CURRENT=$($info.current)"
+            "LATEST=$($info.latest)"
+        }
+        default {
+            "STATUS=error"
+            "MESSAGE=$(([string]$info.message) -replace '\r?\n', ' ')"
+        }
+    }
+}
+
+function Invoke-CheckUpdate {
+    Write-ReleaseInfo (Get-ReleaseInfo)
+}
+
+function Invoke-UpdateNow {
+    $info = Get-ReleaseInfo
+    if ($info.status -ne 'update_available') { Write-ReleaseInfo $info; return }
+
+    $previous = $info.current
+    $tmp = Join-Path $env:TEMP ("claude-switcher-update-" + [guid]::NewGuid().ToString('N'))
+    $files = @('claude-switch.ps1', 'claude-bodyguard.ps1', 'SwitcherUI.ps1')
+    $backupDir = $null
+    $backedUp = @{}
+    $task = Get-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue
+    $versionPath = Join-Path $BASE 'version.txt'
+    $versionExisted = Test-Path -LiteralPath $versionPath
+    $versionRaw = $null
+    if ($versionExisted) {
+        try { $versionRaw = [System.IO.File]::ReadAllText($versionPath) } catch { $versionExisted = $false }
+    }
+
+    try {
+        New-Item -ItemType Directory -Force -Path $tmp -ErrorAction Stop | Out-Null
+
+        $zipUrl = [string]$info.zip
+        $sumsUrl = [string]$info.sums
+        if (-not (Test-GitHubDownloadUrl $zipUrl)) { throw '更新包下载地址不是 GitHub 官方域名' }
+        if (-not (Test-GitHubDownloadUrl $sumsUrl)) { throw '校验文件下载地址不是 GitHub 官方域名' }
+
+        $zipName = [System.IO.Path]::GetFileName(([Uri]$zipUrl).AbsolutePath)
+        if ([string]::IsNullOrWhiteSpace($zipName)) { $zipName = 'windows-update.zip' }
+        $zipPath = Join-Path $tmp $zipName
+        $sumsPath = Join-Path $tmp 'SHA256SUMS-release.txt'
+        Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsPath -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+
+        $expected = $null
+        foreach ($line in Get-Content -LiteralPath $sumsPath -ErrorAction Stop) {
+            if ($line -match '^([0-9A-Fa-f]{64})\s+\*?(.+?)\s*$') {
+                $name = [System.IO.Path]::GetFileName($Matches[2].Trim())
+                if ($name -eq $zipName) { $expected = $Matches[1].ToUpperInvariant(); break }
+            }
+        }
+        if (-not $expected) { throw 'SHA256SUMS 中未找到更新包哈希' }
+        $actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToUpperInvariant()
+        if ($actual -ne $expected) { throw '校验失败' }
+
+        $extract = Join-Path $tmp 'extract'
+        Expand-Archive -LiteralPath $zipPath -DestinationPath $extract -Force -ErrorAction Stop
+        $newCore = Get-ChildItem -LiteralPath $extract -Recurse -Filter 'claude-switch.ps1' -File -ErrorAction Stop | Select-Object -First 1
+        if (-not $newCore) { throw '更新包中未找到 claude-switch.ps1' }
+        $pkgDir = $newCore.Directory.FullName
+        foreach ($fn in $files) {
+            if (-not (Test-Path -LiteralPath (Join-Path $pkgDir $fn))) { throw "更新包缺少 $fn" }
+        }
+
+        # 保留当前安装的 4 项用户配置
+        $currentText = [System.IO.File]::ReadAllText((Join-Path $BASE 'claude-switch.ps1'))
+        $newText = [System.IO.File]::ReadAllText($newCore.FullName)
+        foreach ($name in @('PROXY_MODE', 'COUNTRY_TARGET', 'TZ_TARGET', 'PROXY_GROUP')) {
+            $value = Get-ScriptConfigValue $currentText $name
+            if ($null -ne $value) { $newText = Set-ScriptConfigValue $newText $name ([string]$value) }
+        }
+
+        $safeVersion = if ($previous) { $previous -replace '[^0-9A-Za-z._-]', '_' } else { 'unknown' }
+        $backupDir = Join-Path $BASE ("backup-" + $safeVersion + "-" + (Get-Date -Format 'yyyyMMddHHmmss'))
+        New-Item -ItemType Directory -Force -Path $backupDir -ErrorAction Stop | Out-Null
+        foreach ($fn in $files) {
+            $src = Join-Path $BASE $fn
+            if (Test-Path -LiteralPath $src) {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $backupDir $fn) -Force -ErrorAction Stop
+                $backedUp[$fn] = $true
+            } else {
+                $backedUp[$fn] = $false
+            }
+        }
+
+        if ($task) { Stop-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue }
+
+        $stagedCore = Join-Path $tmp 'claude-switch.new.ps1'
+        [System.IO.File]::WriteAllText($stagedCore, $newText, (New-Object System.Text.UTF8Encoding($true)))
+        Copy-Item -LiteralPath $stagedCore -Destination (Join-Path $BASE 'claude-switch.ps1') -Force -ErrorAction Stop
+        foreach ($fn in @('claude-bodyguard.ps1', 'SwitcherUI.ps1')) {
+            Copy-Item -LiteralPath (Join-Path $pkgDir $fn) -Destination (Join-Path $BASE $fn) -Force -ErrorAction Stop
+        }
+        [System.IO.File]::WriteAllText($versionPath, [string]$info.latest, (New-Object System.Text.UTF8Encoding($false)))
+        if ($task) { Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction Stop }
+
+        "STATUS=updated"
+        "LATEST=$($info.latest)"
+        "PREVIOUS=$previous"
+        "MESSAGE=更新完成"
+    } catch {
+        $reason = ([string]$_.Exception.Message) -replace '\r?\n', ' '
+        if ($backupDir -and (Test-Path -LiteralPath $backupDir)) {
+            foreach ($fn in $files) {
+                $dst = Join-Path $BASE $fn
+                $bak = Join-Path $backupDir $fn
+                if ($backedUp[$fn] -and (Test-Path -LiteralPath $bak)) {
+                    Copy-Item -LiteralPath $bak -Destination $dst -Force -ErrorAction SilentlyContinue
+                } elseif ($backedUp.ContainsKey($fn) -and -not $backedUp[$fn]) {
+                    Remove-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue
+                }
+            }
+            try {
+                if ($versionExisted -and $null -ne $versionRaw) {
+                    [System.IO.File]::WriteAllText($versionPath, $versionRaw, (New-Object System.Text.UTF8Encoding($false)))
+                } else {
+                    Remove-Item -LiteralPath $versionPath -Force -ErrorAction SilentlyContinue
+                }
+            } catch {}
+        }
+        if ($task) {
+            try { Start-ScheduledTask -TaskName 'ClaudeBodyguard' -ErrorAction SilentlyContinue } catch {}
+        }
+        "STATUS=error"
+        "MESSAGE=$reason"
+    } finally {
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 switch ($args[0]) {
     'checkdetail' {
         $r = Invoke-CheckDetail
         $r | Out-File -Encoding utf8 "$BASE\last-check.txt"
         $r
     }
-    'status' { Invoke-Status }
-    'fix'    { Invoke-Fix }
-    'switch' { Invoke-Switch $args[1] }
-    default  { "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B" }
+    'status'       { Invoke-Status }
+    'fix'          { Invoke-Fix }
+    'switch'       { Invoke-Switch $args[1] }
+    'check-update' { Invoke-CheckUpdate }
+    'update-now'   { Invoke-UpdateNow }
+    default        { "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|check-update|update-now" }
 }

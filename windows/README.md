@@ -26,6 +26,19 @@
    ```
 4. 按提示确认/选择代理客户端，走完流程后桌面会出现「Claude切换器」快捷方式
 
+## 更新
+
+Windows 版启动时会静默检查 GitHub 最新 Release，有新版本时在账号卡下方显示提示条：
+
+- **自动检查**：启动后后台调用 `check-update`，不阻塞界面；24 小时缓存命中时直接显示提示条，不重复打扰
+- **一键更新**：点「一键更新」后自动下载 Windows zip 与 `SHA256SUMS-release.txt`，SHA256 校验通过才替换 `%USERPROFILE%\.claude-switcher` 下的 `claude-switch.ps1` / `claude-bodyguard.ps1` / `SwitcherUI.ps1`
+- **保留配置**：更新前读取旧脚本的 `$PROXY_MODE` / `$COUNTRY_TARGET` / `$TZ_TARGET` / `$PROXY_GROUP`，写入新脚本对应行
+- **备份与回滚**：替换前备份到 `backup-<当前版本>-<时间戳>\`；任一步失败会自动回滚并提示原因，旧版本继续可用
+- **无需管理员**：更新只改当前用户目录，不弹 UAC；替换后重启 `ClaudeBodyguard` 计划任务并自动重启界面
+- **稍后与手动检查**：点「稍后」会隐藏提示条，24 小时内不再自动提示；底部「检查更新」会清除缓存并立即检查一次
+
+版本号来自 zip 根目录的 `VERSION` 文件（由 release 流水线打包时写入），安装后保存在 `%USERPROFILE%\.claude-switcher\version.txt`。**该更新流程尚未经过 Windows 真机验证**，遇到问题请到 Issues 反馈。
+
 ## 多代理客户端支持
 
 | 客户端 | `$PROXY_MODE` | 存活判定 | 说明 |
@@ -42,7 +55,7 @@ TUN 判定顺序：先看是否存在 `198.18.x.x` 假 IP（Clash 系 fake-ip）
 
 ## 与 macOS 版的差异（注意事项）
 
-> macOS 版支持 Clash Verge / Shadowrocket / sing-box / ClashX / Surge 与地区自适应（按出口国家自动锁定时区+地区格式，换节点后 `set-region` 一键重配）。Windows 版已对齐多客户端检测，但 **Shadowrocket 仅 macOS 可用**；Windows 的时区映射表目前覆盖美国主要时区、加拿大多伦多/温哥华、日本、韩国、新加坡、台湾、香港、英国、德国、法国、澳大利亚（悉尼/墨尔本），其他时区会回退到 `Eastern Standard Time`，可在脚本头部手动修改 `$TZ_TARGET`。`地区` 检查目前仍固定为 `en-US`，不随出口国家调整。换国家后 Windows 版暂无 `set-region`，需要重跑安装器（会重新写入 `$COUNTRY_TARGET` / `$TZ_TARGET`）或手动修改脚本头部。自动更新（`update` 命令 + 12 小时自动检查）与 48 小时 IP 审查目前仅 macOS 版提供，后续版本同步。
+> macOS 版支持 Clash Verge / Shadowrocket / sing-box / ClashX / Surge 与地区自适应（按出口国家自动锁定时区+地区格式，换节点后 `set-region` 一键重配）。Windows 版已对齐多客户端检测，但 **Shadowrocket 仅 macOS 可用**；Windows 的时区映射表目前覆盖美国主要时区、加拿大多伦多/温哥华、日本、韩国、新加坡、台湾、香港、英国、德国、法国、澳大利亚（悉尼/墨尔本），其他时区会回退到 `Eastern Standard Time`，可在脚本头部手动修改 `$TZ_TARGET`。`地区` 检查目前仍固定为 `en-US`，不随出口国家调整。换国家后 Windows 版暂无 `set-region`，需要重跑安装器（会重新写入 `$COUNTRY_TARGET` / `$TZ_TARGET`）或手动修改脚本头部。macOS 的 `update` 命令与 12 小时自动检查、48 小时 IP 审查未移植到 Windows；Windows 另有一套启动检查 + 一键更新，见上文「更新」。
 
 | 项目 | 说明 |
 |---|---|

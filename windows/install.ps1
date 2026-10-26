@@ -131,6 +131,17 @@ $core = $core -replace '\$PROXY_GROUP = "[^"]*"', ('$$PROXY_GROUP = "' + $grpEsc
 $utf8Bom = New-Object System.Text.UTF8Encoding -ArgumentList $true
 [System.IO.File]::WriteAllText("$BASE\claude-switch.ps1", $core, $utf8Bom)
 $PROXY_MODE | Out-File -Encoding ascii -NoNewline "$BASE\proxy-mode.txt"
+
+# 版本号由 release 打包时写入 zip 根的 VERSION;开发目录没有该文件则记为 unknown
+$versionSrc = Join-Path $PSScriptRoot '..\VERSION'
+if (-not (Test-Path -LiteralPath $versionSrc)) { $versionSrc = Join-Path $PSScriptRoot 'VERSION' }
+$appVersion = 'unknown'
+if (Test-Path -LiteralPath $versionSrc) {
+    $rawVersion = Get-Content -LiteralPath $versionSrc -Raw -ErrorAction SilentlyContinue
+    if ($null -ne $rawVersion -and ([string]$rawVersion).Trim()) { $appVersion = ([string]$rawVersion).Trim() }
+}
+[System.IO.File]::WriteAllText((Join-Path $BASE 'version.txt'), $appVersion, (New-Object System.Text.UTF8Encoding($false)))
+Write-Host "[OK] 版本: $appVersion" -ForegroundColor Green
 Write-Host "[OK] 核心文件已安装到 $BASE (代理模式: $PROXY_MODE)" -ForegroundColor Green
 
 # ---- 5. 桌面快捷方式 ----
