@@ -140,6 +140,382 @@ if __name__ == "__main__":
 PY_PROXY_DIAGNOSE
 fi
 
+if [ "${1:-}" = "clash-rules" ]; then
+    shift
+    exec "${CLAUDE_SWITCHER_PYTHON:-python3}" - "$@" <<'PY_CLASH_RULES'
+"""Install and verify the Clash Verge global script without trusting Merge.yaml text."""
+import http.client
+import ipaddress
+import json
+import os
+import re
+import shutil
+import socket
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+DOMAINS = (
+    "claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com",
+    "challenges.cloudflare.com", "datadoghq.com", "segment.io", "stripe.com",
+    "stripe.network", "stripecdn.com", "intercom.io", "intercomcdn.com",
+    "intercomassets.com",
+)
+PORTS = (3478, 5349, 19302)
+SCRIPT_BEGIN = "// >>> claude-switcher managed rules >>>"
+SCRIPT_END = "// <<< claude-switcher managed rules <<<"
+MERGE_BEGIN = "# >>> claude-switcher pinned rules >>>"
+MERGE_END = "# <<< claude-switcher pinned rules <<<"
+
+
+def fail(message):
+    print("FAIL:" + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read_yaml_scalar(path, key):
+    if not path.exists():
+        return ""
+    match = re.search(r"^" + re.escape(key) + r":[ \t]*(.*)$", read_text(path), re.M)
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    if value.startswith('"'):
+        return json.JSONDecoder().raw_decode(value)[0]
+    if value.startswith("'"):
+        match = re.fullmatch(r"'((?:[^']|'')*)'\s*(?:#.*)?", value)
+        if not match:
+            fail("无法读取 Clash 控制接口配置")
+        return match.group(1).replace("''", "'")
+    value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+    if value in {"", "null", "~"}:
+        return ""
+    if value.startswith(("|", ">", "*", "&", "[", "{")):
+        fail("Clash 控制接口需要普通标量配置")
+    return value
+
+
+def read_text(path):
+    return path.read_bytes().decode("utf-8-sig")
+
+
+def controller_config(clash_dir):
+    for name in ("clash-verge.yaml", "verge.yaml"):
+        path = clash_dir / name
+        unix_path = read_yaml_scalar(path, "external-controller-unix")
+        secret = read_yaml_scalar(path, "secret")
+        if "\r" in secret or "\n" in secret:
+            fail("Clash 控制接口密钥格式无效")
+        if unix_path and hasattr(socket, "AF_UNIX"):
+            if not os.path.isabs(unix_path):
+                fail("Clash Unix socket 路径必须为绝对路径")
+            return ("unix", unix_path, None), secret
+        endpoint = read_yaml_scalar(path, "external-controller")
+        if endpoint:
+            if not endpoint.startswith(("http://", "https://")):
+                endpoint = "http://" + endpoint
+            parsed = urlsplit(endpoint)
+            host = parsed.hostname
+            if host in {"0.0.0.0", "::"}:
+                host = "127.0.0.1" if host == "0.0.0.0" else "::1"
+            if host != "localhost":
+                try:
+                    local = ipaddress.ip_address(host).is_loopback
+                except ValueError:
+                    local = False
+                if not local:
+                    fail("只允许验证本机 Clash 控制接口")
+            if (parsed.scheme not in {"http", "https"} or not parsed.port
+                    or parsed.username or parsed.password or parsed.path not in {"", "/"}
+                    or parsed.query or parsed.fragment):
+                fail("Clash 控制接口地址格式无效")
+            return (parsed.scheme, host, parsed.port), secret
+    fail("未找到本机 Clash 控制接口，无法验证内核规则")
+
+
+def api_get(endpoint, secret, path):
+    headers = {"Accept": "application/json"}
+    if secret:
+        headers["Authorization"] = "Bearer " + secret
+    scheme, host, port = endpoint
+    connection = None
+    try:
+        if scheme == "unix":
+            connection = http.client.HTTPConnection("localhost", timeout=2)
+            connection.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.sock.settimeout(2)
+            connection.sock.connect(host)
+        else:
+            cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+            connection = cls(host, port, timeout=2)
+        # http.client connects directly; inherited proxy variables are never used.
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        if response.status != 200:
+            fail("Clash 内核接口未返回成功状态")
+        data = response.read(2 * 1024 * 1024 + 1)
+        if len(data) > 2 * 1024 * 1024:
+            fail("Clash 内核接口响应过大")
+        value = json.loads(data.decode("utf-8"))
+        if not isinstance(value, dict):
+            fail("Clash 内核接口返回格式异常")
+        return value
+    except (http.client.HTTPException, OSError, ValueError) as exc:
+        fail("Clash 内核接口不可用(" + exc.__class__.__name__ + ")")
+    finally:
+        if connection:
+            connection.close()
+
+
+def selected_proxy(proxies, name, seen=None):
+    seen = set() if seen is None else seen
+    if name in seen:
+        fail("代理组存在循环引用")
+    seen.add(name)
+    item = proxies.get(name)
+    if not isinstance(item, dict):
+        fail("代理组不存在:" + name)
+    if "all" in item or "now" in item:
+        current = item.get("now")
+        if not current or current == name:
+            fail("代理组没有可用的当前节点:" + name)
+        return selected_proxy(proxies, current, seen)
+    return item
+
+
+def validate_group(state, group, policy):
+    proxies = state.get("proxies", {}).get("proxies", {})
+    if not isinstance(proxies, dict) or group in {"DIRECT", "REJECT", "GLOBAL", "PASS"}:
+        fail("请选择实际的代理组")
+    if not isinstance(proxies.get(group), dict) or "all" not in proxies[group]:
+        fail("配置的代理组不存在")
+    selected = selected_proxy(proxies, group)
+    selected_type = str(selected.get("type", "")).lower()
+    if selected_type in {"direct", "reject", "block"}:
+        fail("代理组当前节点为直连或拒绝，请选择代理节点")
+    if policy == "proxy" and selected.get("udp") is not True:
+        fail("当前节点未确认支持 UDP，请更换节点或选择 reject 策略")
+
+
+def norm(value):
+    return re.sub(r"[\s()_-]+", "", str(value).upper()).replace("&&", ",")
+
+
+def expected_rules():
+    rules = [("port", p) for p in PORTS]
+    rules.extend(("domain", d) for d in DOMAINS)
+    return rules
+
+
+def verify_runtime(clash_dir, group, policy):
+    base, secret = controller_config(clash_dir)
+    state = {
+        "configs": api_get(base, secret, "/configs"),
+        "rules": api_get(base, secret, "/rules"),
+        "proxies": api_get(base, secret, "/proxies"),
+    }
+    if str(state["configs"].get("mode", "")).lower() != "rule":
+        fail("Clash 当前不是 rule 模式")
+    validate_group(state, group, policy)
+    rules = state["rules"].get("rules")
+    if not isinstance(rules, list):
+        fail("Clash /rules 返回格式异常")
+    expected = expected_rules()
+    if len(rules) < len(expected):
+        fail("运行中的规则数量不足")
+    for index, (kind, value) in enumerate(expected):
+        if kind == "port":
+            rule = rules[index]
+            target = "REJECT" if policy == "reject" else group
+            payload = norm(rule.get("payload", "")) if isinstance(rule, dict) else ""
+            if (not isinstance(rule, dict) or str(rule.get("type", "")).upper() != "AND"
+                    or payload != "NETWORK,UDP,DSTPORT," + str(value)
+                    or rule.get("proxy") != target
+                    or (rule.get("extra") or {}).get("disabled") is True):
+                fail("运行规则未按策略置顶:UDP/" + str(value))
+        else:
+            rule = rules[index]
+            if (not isinstance(rule, dict)
+                    or str(rule.get("type", "")).upper().replace("_", "-") not in {"DOMAIN-SUFFIX", "DOMAINSUFFIX"}
+                    or str(rule.get("payload", "")).strip().lower() != value
+                    or rule.get("proxy") != group
+                    or (rule.get("extra") or {}).get("disabled") is True):
+                fail("运行规则未按策略置顶:" + value)
+    return state
+
+
+def rule_strings(group, policy):
+    target = "REJECT" if policy == "reject" else group
+    return ([f"AND,((NETWORK,UDP),(DST-PORT,{port})),{target}" for port in PORTS] +
+            [f"DOMAIN-SUFFIX,{domain},{group}" for domain in DOMAINS])
+
+
+def managed_block(group, policy):
+    encoded = json.dumps(rule_strings(group, policy), ensure_ascii=False)
+    group_json = json.dumps(group, ensure_ascii=False)
+    return f"""{SCRIPT_BEGIN}
+;(function () {{
+  const originalMain = main;
+  const pinnedRules = {encoded};
+  const group = {group_json};
+  main = function (config, ...args) {{
+    const result = originalMain(config, ...args);
+    if (!result || typeof result !== \"object\" || Array.isArray(result)) throw new Error(\"claude-switcher: original main must return a config object\");
+    if (!Array.isArray(result[\"proxy-groups\"]) || !result[\"proxy-groups\"].some((item) => item && item.name === group)) throw new Error(\"claude-switcher: configured proxy group missing\");
+    if (result.rules !== undefined && !Array.isArray(result.rules)) throw new Error(\"claude-switcher: rules must be an array\");
+    result.rules = pinnedRules.concat((result.rules || []).filter((rule) => !pinnedRules.includes(rule)));
+    return result;
+  }};
+}})();
+{SCRIPT_END}"""
+
+
+def script_text(path, group, policy):
+    old = read_text(path) if path.exists() else ""
+    block = managed_block(group, policy)
+    if SCRIPT_BEGIN in old:
+        if old.count(SCRIPT_BEGIN) != 1 or old.count(SCRIPT_END) != 1:
+            fail("Script.js 中存在未闭合的 claude-switcher 管理块")
+        pattern = re.compile(re.escape(SCRIPT_BEGIN) + r".*?" + re.escape(SCRIPT_END), re.S)
+        if old.index(SCRIPT_END) < old.index(SCRIPT_BEGIN):
+            fail("Script.js 中的管理块顺序无效")
+        return pattern.sub(lambda _: block, old, count=1)
+    if SCRIPT_END in old:
+        fail("Script.js 中存在孤立的 claude-switcher 管理块")
+    if not old.strip():
+        old = "function main(config) { return config; }\n"
+    match = re.search(r"function\s+main\s*\(", old)
+    if not match:
+        fail("现有 Script.js 没有可组合的 main(config)，已停止以免覆盖用户脚本")
+    return old + ("" if old.endswith("\n") else "\n") + block + "\n"
+
+
+def migrate_merge(path):
+    if not path.exists():
+        return None
+    old = read_text(path)
+    if MERGE_BEGIN not in old:
+        if MERGE_END in old:
+            fail("Merge.yaml 中存在孤立的 claude-switcher 管理块")
+        return old
+    if old.count(MERGE_BEGIN) != 1 or old.count(MERGE_END) != 1 or old.index(MERGE_END) < old.index(MERGE_BEGIN):
+        fail("Merge.yaml 中存在未闭合的 claude-switcher 管理块")
+    pattern = re.compile(r"(?ms)^[ \t]*" + re.escape(MERGE_BEGIN) + r"[ \t]*\r?\n.*?^[ \t]*" + re.escape(MERGE_END) + r"[ \t]*\r?\n?")
+    new = pattern.sub("", old, count=1)
+    return new
+
+
+def write_changes(changes):
+    changes = {path: data.encode("utf-8") for path, data in changes.items()
+               if not path.exists() or path.read_bytes() != data.encode("utf-8")}
+    originals, staged, replaced = {}, {}, []
+    try:
+        for path, data in changes.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            originals[path] = path.read_bytes() if path.exists() else None
+            if path.exists():
+                shutil.copy2(path, path.with_name(path.name + ".bak." + str(time.time_ns())))
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".claude-switcher-", delete=False) as handle:
+                staged[path] = Path(handle.name)
+                handle.write(data)
+            if path.exists():
+                staged[path].chmod(path.stat().st_mode & 0o777)
+        for path, temp in staged.items():
+            temp.replace(path)
+            replaced.append(path)
+    except OSError:
+        for path in reversed(replaced):
+            if originals[path] is None:
+                path.unlink()
+            else:
+                path.write_bytes(originals[path])
+        raise
+    finally:
+        for temp in staged.values():
+            if temp.exists():
+                temp.unlink()
+
+
+def assess_probe(policy, expected_ip, output, exit_code):
+    if exit_code != "0":
+        return "fail:STUN 探测执行失败，未确认 UDP 出口"
+    try:
+        expected = ipaddress.IPv4Address(expected_ip)
+    except ValueError:
+        return "fail:未获取有效的 IPv4 出口，无法比对 STUN 结果"
+    if output == "RESULT:NONE":
+        if policy == "reject":
+            return "ok:常见 STUN UDP 拒绝规则已验证，探测无响应"
+        return "fail:STUN 无响应，无法确认 UDP 是否经过代理"
+    if not output.startswith("RESULT:"):
+        return "fail:STUN 探测结果格式异常"
+    try:
+        addresses = [ipaddress.IPv4Address(value) for value in output[7:].split(",")]
+    except ValueError:
+        return "fail:STUN 探测结果格式异常"
+    if policy == "reject":
+        return "fail:拒绝策略下仍收到 STUN 响应，请检查运行规则"
+    if any(address != expected for address in addresses):
+        return "fail:STUN 暴露了非代理出口地址"
+    return "ok:STUN 仅返回代理出口地址"
+
+
+def main():
+    if len(sys.argv) < 5:
+        fail("内部参数不足")
+    action, clash_dir, base_dir, group = sys.argv[1:5]
+    clash_dir = Path(clash_dir)
+    base_dir = Path(base_dir)
+    policy_path = base_dir / "webrtc-policy"
+    policy = sys.argv[5] if len(sys.argv) > 5 else ""
+    policy = policy or (read_text(policy_path).strip() if policy_path.exists() else "proxy")
+    if policy not in {"proxy", "reject"}:
+        fail("WEBRTC_POLICY 只能是 proxy 或 reject")
+    if action == "policy":
+        print(policy)
+        return 0
+    if action == "assess" and len(sys.argv) == 9:
+        print(assess_probe(policy, *sys.argv[6:9]))
+        return 0
+    if not group or any(char in group for char in ",\r\n"):
+        fail("代理组名为空或包含规则分隔符")
+    if action == "verify":
+        verify_runtime(clash_dir, group, policy)
+        print("OK:运行时规则已验证(" + policy + ")")
+        return 0
+    if action != "write":
+        fail("未知内部动作")
+
+    base, secret = controller_config(clash_dir)
+    state = {"configs": api_get(base, secret, "/configs"),
+             "proxies": api_get(base, secret, "/proxies")}
+    if str(state["configs"].get("mode", "")).lower() != "rule":
+        fail("Clash 当前不是 rule 模式")
+    validate_group(state, group, policy)
+    profiles = clash_dir / "profiles"
+    script_path = profiles / "Script.js"
+    merge_path = profiles / "Merge.yaml"
+    new_script = script_text(script_path, group, policy)
+    new_merge = migrate_merge(merge_path)
+    changes = {script_path: new_script, policy_path: policy + "\n"}
+    if new_merge is not None:
+        changes[merge_path] = new_merge
+    write_changes(changes)
+    print("OK:全局脚本已写入(" + policy + ")")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, TypeError, AttributeError):
+        fail("规则配置处理失败，未确认修复；请检查配置格式与权限")
+PY_CLASH_RULES
+fi
+
 # ============ 安装时可配置项(安装程序会自动改写) ============
 PROXY_MODE="clash-verge"       # 代理客户端: clash-verge|shadowrocket|sing-box|clashx|surge|auto
 PROXY_GROUP="IpEqual"          # Clash 代理组名(安装时自动探测)
@@ -210,16 +586,16 @@ proxy_alive() {
     esac
 }
 
-# 置顶规则配置检查(仅 Clash Verge):合并配置里是否含置顶规则
-merge_ok() {
-    grep -q "DOMAIN-SUFFIX,claude.ai,$PROXY_GROUP" "$CLASH_DIR/clash-verge.yaml" 2>/dev/null
+# 单文件内嵌 Python 的隔离入口;策略从 WEBRTC_POLICY 或持久化文件读取。
+clash_rules() {
+    local action="$1"
+    shift
+    "${BASH:-/bin/bash}" "$0" clash-rules "$action" "$CLASH_DIR" "$BASE" "$PROXY_GROUP" "${WEBRTC_POLICY:-}" "$@"
 }
 
-# STUN/TURN 端口置顶是否已生效(国内直连规则会把 stun.miwifi.com 等判直连,UDP 需按端口强制进隧道)
-stun_ok() {
-    grep -q 'DST-PORT,3478,' "$CLASH_DIR/clash-verge.yaml" 2>/dev/null \
-        || grep -q 'DST-PORT,3478,' "$CLASH_DIR/profiles/Merge.yaml" 2>/dev/null
-}
+# 只接受运行中内核加载的规则，不再用配置文本或 fake-ip 代替。
+merge_ok() { clash_rules verify >/dev/null 2>&1; }
+stun_ok() { merge_ok; }
 
 # 置顶规则行为检测:三个生态域名全部解析到 fake-ip 段(198.18.x.x)即视为已置顶;未命中域名记入 ROUTE_MISSED
 route_ok() {
@@ -295,25 +671,14 @@ check() {
         *) fails="$fails;DNS未走隧道(返回${dnsip:-空})" ;;
     esac
 
-    wr=$(webrtc_test)
-    if [ "$wr" != "RESULT:NONE" ]; then
-        case "$wr" in
-            RESULT:*)
-                wips=${wr#RESULT:}
-                leak=""
-                OLDIFS=$IFS; IFS=','
-                for w in $wips; do [ "$w" != "$ip" ] && leak="$leak $w"; done
-                IFS=$OLDIFS
-                [ -n "$leak" ] && fails="$fails;WebRTC泄漏($leak)" ;;
-            *) fails="$fails;WebRTC检测异常" ;;
-        esac
-    fi
+    wr=$(webrtc_status "$ip")
+    case "$wr" in fail:*) fails="$fails;WebRTC:${wr#fail:}" ;; esac
 
     launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || fails="$fails;保镖未运行"
 
-    # 置顶规则:Clash Verge 看配置或行为任一通过;其他客户端只看行为检测
+    # 置顶规则:Clash Verge 验证运行内核;其他客户端只看行为检测
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        merge_ok || route_ok || fails="$fails;置顶规则缺失"
+        merge_ok || fails="$fails;运行中置顶规则未验证"
     else
         route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
     fi
@@ -338,6 +703,29 @@ check() {
 # WebRTC/STUN 探测:返回 RESULT:ip,ip 或 RESULT:NONE 或空
 webrtc_test() {
     python3 "$BASE/stun-probe.py" 2>/dev/null
+}
+
+# 日常检查与修复共用此判断。先确认规则，再允许探测，避免向已知直连路径发包。
+webrtc_status() {
+    local verified result probe_rc assessment
+    if [ "$PROXY_MODE" = "clash-verge" ]; then
+        if ! verified=$(clash_rules verify 2>&1); then
+            echo "fail:运行规则未验证:${verified#FAIL:}"
+            return
+        fi
+    fi
+    result=$(webrtc_test)
+    probe_rc=$?
+    if [ "$PROXY_MODE" = "clash-verge" ]; then
+        assessment=$(clash_rules assess "$1" "$result" "$probe_rc" 2>/dev/null)
+    else
+        # 其他客户端的规则由用户管理，不能把 reject 的无响应视为已验证。
+        assessment=$(WEBRTC_POLICY=proxy clash_rules assess "$1" "$result" "$probe_rc" 2>/dev/null)
+    fi
+    case "$assessment" in
+        ok:*|fail:*) echo "$assessment" ;;
+        *) echo 'fail:无法评估 STUN 结果' ;;
+    esac
 }
 
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
@@ -385,18 +773,7 @@ checkdetail() {
         198.18.*) echo 'DNS=ok:走隧道' ;;
         *) echo "DNS=fail:未走隧道(${dnsip:-空})" ;;
     esac
-    wr=$(webrtc_test)
-    case "$wr" in
-        RESULT:NONE) echo 'WebRTC=ok:UDP不出网,零暴露' ;;
-        RESULT:*)
-            wips=${wr#RESULT:}
-            leak=""
-            OLDIFS=$IFS; IFS=','
-            for w in $wips; do [ "$w" != "$ip" ] && leak="$leak $w"; done
-            IFS=$OLDIFS
-            if [ -n "$leak" ]; then echo "WebRTC=fail:暴露非代理IP:$leak"; else echo 'WebRTC=ok:仅暴露代理IP'; fi ;;
-        *) echo 'WebRTC=fail:检测异常' ;;
-    esac
+    echo "WebRTC=$(webrtc_status "$ip")"
     if launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
         lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null | cut -c1-40)
         echo "保镖=ok:${lastkill:-待命}"
@@ -407,8 +784,6 @@ checkdetail() {
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         if merge_ok; then
             echo '规则置顶=ok'
-        elif route_ok; then
-            echo '规则置顶=ok:行为检测通过'
         else
             echo '规则置顶=fail:未生效'
         fi
@@ -452,106 +827,19 @@ checkdetail() {
     fi
 }
 
-# 置顶规则写入(智能合并):不整文件覆盖,用户已有的 Merge 配置原样保留
-# 标记块自包含 prepend-rules 键+全部规则,重复执行幂等
-write_merge_rules() {
-    M="$CLASH_DIR/profiles/Merge.yaml"
-    B0="# >>> claude-switcher pinned rules >>>"
-    B1="# <<< claude-switcher pinned rules <<<"
-    mkdir -p "$CLASH_DIR/profiles"
-    # 置顶规则清单(缩进两格)
-    rules=""
-    for d in claude.ai claude.com anthropic.com claudeusercontent.com challenges.cloudflare.com datadoghq.com segment.io stripe.com stripe.network stripecdn.com intercom.io intercomcdn.com intercomassets.com; do
-        rules="$rules  - DOMAIN-SUFFIX,$d,$PROXY_GROUP
-"
-    done
-    # STUN/TURN 标准端口置顶:即使用户规则集把国内 STUN 域名判为直连,WebRTC 探测的 UDP 也必须进隧道
-    for p in 3478 5349 19302; do
-        rules="$rules  - DST-PORT,$p,$PROXY_GROUP
-"
-    done
-
-    # 首次:文件不存在,整文件写入
-    if [ ! -f "$M" ]; then
-        cat > "$M" <<MEOF
-# Profile Enhancement Merge Template for Clash Verge
-
-profile:
-  store-selected: true
-
-# Claude 全家族及生态域名置顶强制走代理(优先级高于任何国内规则集)
-$B0
-prepend-rules:
-$rules$B1
-MEOF
-        return 0
-    fi
-
-    # 已存在:备份后幂等替换(只在将要修改时备份)
-    cp "$M" "$M.bak.$(date +%Y%m%d%H%M%S)"
-    tmp="$M.cs.tmp"
-    cp "$M" "$tmp"
-    # 删除旧标记块(含标记行,兼容块在 prepend-rules 下缩进的情形)
-    if grep -qF "$B0" "$tmp"; then
-        awk -v b0="$B0" -v b1="$B1" '
-            index($0, b0) {inblock=1; next}
-            inblock && index($0, b1) {inblock=0; next}
-            !inblock
-        ' "$tmp" > "$tmp.out" && mv "$tmp.out" "$tmp"
-        # 清理孤立的 prepend-rules: 键(其后没有规则行,只剩空行/注释/EOF)
-        awk '
-            { L[NR]=$0 }
-            END {
-                for (i=1; i<=NR; i++) {
-                    if (L[i] ~ /^prepend-rules:/) {
-                        has=0
-                        for (j=i+1; j<=NR; j++) {
-                            if (L[j] ~ /^[ \t]*- /) { has=1; break }
-                            if (L[j] ~ /^[ \t]*$/ || L[j] ~ /^[ \t]*#/) continue
-                            break
-                        }
-                        if (!has) continue
-                    }
-                    print L[i]
-                }
-            }
-        ' "$tmp" > "$tmp.out" && mv "$tmp.out" "$tmp"
-    fi
-    # 注入:已有 prepend-rules: 则标记规则块(不带键)插到该行之后,否则文件顶部插入完整块
-    # 注意:多行文本走环境变量传递(macOS awk 的 -v 不支持含换行的字符串);先写中间文件再替换,失败不碰原文件
-    if grep -q '^prepend-rules:' "$tmp"; then
-        if MARK0="$B0" MARK1="$B1" RULES="$rules" awk '
-            /^prepend-rules:/ && !done {
-                print
-                print "  " ENVIRON["MARK0"]
-                printf "%s", ENVIRON["RULES"]
-                print "  " ENVIRON["MARK1"]
-                done=1
-                next
-            }
-            { print }
-        ' "$tmp" > "$tmp.out"; then
-            mv "$tmp.out" "$M" && rm -f "$tmp"
-        else
-            rm -f "$tmp" "$tmp.out"
-            return 1
-        fi
-    else
-        {
-            echo "# Claude 全家族及生态域名置顶强制走代理(优先级高于任何国内规则集)"
-            echo "$B0"
-            echo "prepend-rules:"
-            printf "%s" "$rules"
-            echo "$B1"
-            echo ""
-            cat "$tmp"
-        } > "$tmp.out" && mv "$tmp.out" "$M" && rm -f "$tmp"
-    fi
-    rm -f "$tmp"
-}
+# 保留隐藏入口供安装器调用;现在生成全局 Script.js 并迁移旧管理块。
+write_merge_rules() { clash_rules write; }
 
 # 一键修复:按项自动修复,每步输出结果
 fix() {
+    if [ "$PROXY_MODE" = "clash-verge" ]; then
+        local policy_result
+        if ! policy_result=$(clash_rules policy 2>&1); then
+            echo "FIX:WebRTC 策略无效 ✗ $policy_result"
+            return 1
+        fi
+        WEBRTC_POLICY="$policy_result"
+    fi
     echo "FIX:开始一键修复"
 
     # A. 代理内核 + TUN
@@ -640,69 +928,41 @@ ASEOF
         echo "FIX:地区格式 → $LOCALE_TARGET ✓"
     fi
 
-    # B2. 置顶规则缺失(含 STUN/TURN 端口) → Clash Verge 智能合并写入 Merge 配置并重启;其他客户端提示自行配置
+    # B2. 更新全局脚本并检查运行规则;写入失败或未加载均不能报成功。
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        if ! merge_ok || ! stun_ok || ! route_ok; then
-            echo "FIX:写入置顶规则(智能合并,不动你的已有配置)..."
-            write_merge_rules
-            osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
-            sleep 3
-            open -a "Clash Verge"
-            for i in $(seq 1 40); do
-                tun_up && break
-                sleep 1
-            done
-            grep -q "DOMAIN-SUFFIX,claude.ai,$PROXY_GROUP" "$CLASH_DIR/clash-verge.yaml" 2>/dev/null \
-                && echo "FIX:置顶规则 ✓" || echo "FIX:置顶规则 ✗"
+        echo "FIX:写入全局扩展脚本(保留已有 main 与无关配置)..."
+        local rules_result
+        if ! rules_result=$(write_merge_rules 2>&1); then
+            echo "FIX:置顶规则 ✗ $rules_result"
+            return 1
         fi
-    else
-        if ! route_ok; then
-            echo "FIX:置顶规则 ✗(未命中:${ROUTE_MISSED# }) — 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
-        fi
-    fi
-
-    # C. WebRTC 泄漏专项:在 TUN/IPv6 已处理后复测;UDP 仍绕过隧道时重载 TUN 再测一次
-    wrip=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2)
-    wr=$(webrtc_test)
-    wr_leak() {
-        case "$1" in
-            RESULT:NONE|"") echo "" ;;
-            RESULT:*)
-                wrl=""
-                OLDIFS=$IFS; IFS=','
-                for w in ${1#RESULT:}; do
-                    [ -n "$2" ] && [ "$w" != "$2" ] && wrl="$wrl $w"
-                done
-                IFS=$OLDIFS
-                echo "${wrl# }" ;;
-            *) echo "" ;;
-        esac
-    }
-    leak=$(wr_leak "$wr" "$wrip")
-    if [ "$wr" = "RESULT:NONE" ]; then
-        echo "FIX:WebRTC ✓ (UDP不出网,零暴露)"
-    elif [ -z "$wr" ]; then
-        echo "FIX:WebRTC - 检测无结果(请确认 python3 与 stun-probe.py 就绪)"
-    elif [ -n "$leak" ] && [ "$PROXY_MODE" = "clash-verge" ] && tun_up; then
-        echo "FIX:WebRTC 泄漏($leak),重载 TUN 后复测..."
         osascript -e 'tell application "Clash Verge" to quit' >/dev/null 2>&1
         sleep 3
         open -a "Clash Verge"
-        for i in $(seq 1 30); do tun_up && break; sleep 1; done
-        sleep 2
-        wr=$(webrtc_test)
-        leak=$(wr_leak "$wr" "$wrip")
-        if [ "$wr" = "RESULT:NONE" ] || [ -z "$leak" ]; then
-            echo "FIX:WebRTC ✓ (TUN 重载后 UDP 已回到隧道)"
-        else
-            echo "FIX:WebRTC ✗ 仍有 UDP 绕过隧道:${leak:-未知}"
-            echo "FIX:请确认 TUN 已开启且节点支持 UDP;浏览器插件只能保护该浏览器,保护不了 Claude 桌面版和其他应用"
+        for i in $(seq 1 40); do tun_up && break; sleep 1; done
+        local loaded=0
+        for i in $(seq 1 5); do
+            if rules_result=$(clash_rules verify 2>&1); then loaded=1; break; fi
+            sleep 1
+        done
+        if [ "$loaded" -ne 1 ]; then
+            echo "FIX:置顶规则 ✗ 未验证内核加载:$rules_result"
+            echo "FIX:请检查全局扩展脚本是否启用、代理组是否存在，以及节点 UDP 支持"
+            return 1
         fi
-    elif [ -n "$leak" ]; then
-        echo "FIX:WebRTC ✗ UDP 绕过隧道($leak) — 当前客户端无法自动重载,请开启 TUN/UDP 转发"
-    else
-        echo "FIX:WebRTC ✓ (仅暴露代理出口IP)"
+        echo "FIX:置顶规则 ✓ 已验证内核实际加载"
+    elif ! route_ok; then
+        echo "FIX:置顶规则 ✗ 请在 $(proxy_name) 中自行添加 DOMAIN-SUFFIX 置顶规则"
     fi
+
+    # C. 复测与日常审计共用判断，空结果、非零退出及无响应不会冒充代理成功。
+    local fix_failed=0
+    wrip=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^ip=' | cut -d= -f2)
+    wr=$(webrtc_status "$wrip")
+    case "$wr" in
+        ok:*) echo "FIX:WebRTC ✓ ${wr#ok:}" ;;
+        *) echo "FIX:WebRTC ✗ ${wr#fail:}"; fix_failed=1 ;;
+    esac
 
     # D. 出口IP最终验证
     sleep 2
@@ -715,6 +975,7 @@ ASEOF
         echo "FIX:出口IP ✗ (${ip:-无}/${loc:-未知},期望$COUNTRY_TARGET) — 可能是节点故障,请到 $(proxy_name) 里换条线路"
     fi
     echo "FIX:修复流程结束"
+    return "$fix_failed"
 }
 
 # 地区自适应:按当前出口国家一键重设 国家/时区/地区格式(换了国家节点后运行)

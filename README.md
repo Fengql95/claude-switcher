@@ -199,18 +199,30 @@ bash core/claude-switch.sh diagnose-proxy --proxy http://127.0.0.1:18080
 
 常见现象：TUN 正常、出口 IP 正确，但 WebRTC 检测失败，提示暴露了国内 IP。根因通常不是隧道坏了，而是规则集把 `stun.miwifi.com` / `stun.chat.bilibili.com` 这类国内 STUN 域名判为 **DIRECT 直连**——STUN 走的是 UDP，直连规则让它绕过了隧道。
 
-处理方式（按优先级）：
+Clash Verge 模式下，运行「一键修复」会把本项目规则写入**全局扩展脚本** `profiles/Script.js`，直接前置到 `config.rules`。已有的 `main(config, profileName)` 会先执行；随后加入 Claude 生态域名规则和 UDP `3478 / 5349 / 19302` 三个常见 STUN/TURN 端口规则。仅迁移旧 `Merge.yaml` 中本项目标记块，其他内容保留，改动前生成 `.bak.*` 备份。
 
-1. **运行一次「一键修复」**：会在置顶规则里补充 `DST-PORT,3478 / 5349 / 19302` 三条端口级规则，把**所有** STUN/TURN 标准端口的 UDP 流量强制拉回代理（不只那两个域名），然后自动重启 Clash Verge 复测
-2. 手动等价操作：Clash Verge → 全局扩展配置(Merge.yaml) → prepend-rules 顶部加：
-   ```yaml
-   - DST-PORT,3478,IpEqual
-   - DST-PORT,5349,IpEqual
-   - DST-PORT,19302,IpEqual
-   ```
-3. 开全局代理也能消除该告警，但属于过度代理——会让所有国内流量绕路，通常不需要
+两种策略：
 
-注意：浏览器插件只能保护该浏览器；系统级根治是让 UDP 进隧道。Claude 自身不用国内 STUN，但你的规则只要允许任意 UDP 直连，其他应用/网页就有暴露真实 IP 的通道。
+| 策略 | 行为 | 使用场景 |
+|---|---|---|
+| `proxy`（默认） | 这些 UDP 请求走安装时选定的实际代理组；当前节点必须支持 UDP | 希望保留 WebRTC 通话能力 |
+| `reject` | 拒绝这三个端口的 UDP，Claude 生态域名仍走代理组 | 接受部分语音、视频会议和 P2P 受影响 |
+
+在 macOS 终端中切换策略并执行修复：
+
+```bash
+WEBRTC_POLICY=reject ~/.local/bin/claude-switch.sh fix
+# 恢复默认代理策略
+WEBRTC_POLICY=proxy ~/.local/bin/claude-switch.sh fix
+```
+
+策略在成功写入后保存到 `~/.claude-switcher/webrtc-policy`，后续 GUI、检查和修复会沿用。**一键修复会重启 Clash Verge**。代理组不存在、当前节点是 DIRECT、节点不支持 UDP、全局脚本未启用、控制接口不可用或内核未加载置顶规则时，都不会显示规则修复成功。节点不支持 UDP 时请换节点或主动选择 `reject`；Mihomo 可能继续向下匹配规则，`proxy` 策略不能保证阻止这种回落。
+
+检查读取本机 Mihomo 的 `/configs`、`/proxies`、`/rules`，核对 rule 模式、代理组及实际规则的顺序、目标和启用状态；不再把文件中的文字或 fake-IP 解析当成规则生效。**STUN 无响应不等于没有泄漏**：默认策略会报告未验证；仅在已验证拒绝规则的 `reject` 策略下，才把探测无响应解释为该端口策略的预期结果。
+
+首次从旧版迁移：请退出 Claude 后，使用最新版仓库的安装器重新安装，再检查结果。旧版 `update` 保留“新版自检失败即回滚”的行为，旧规则未迁移时可能回滚；不要为更新成功而跳过检查。安装器若提示缺少可组合的 `main`，请先备份并在 Clash Verge 的全局扩展脚本中整理现有代码，再重试。其他代理客户端的配置仍由用户自行管理。
+
+这些规则仅覆盖三个常见 UDP 端口，无法覆盖自定义端口、所有 TURN 传输或所有应用的泄漏路径。浏览器插件的作用也限于该浏览器。修复后仍需查看检查结果；不要把一次检测通过视为全系统防泄漏保证。
 
 工具能兜底技术泄漏，兜不住主动作死。以下每条都是社区里用账号堆出来的教训：
 
