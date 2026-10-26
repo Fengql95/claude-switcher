@@ -212,7 +212,15 @@ def controller_config(clash_dir):
         if unix_path and hasattr(socket, "AF_UNIX"):
             if not os.path.isabs(unix_path):
                 fail("Clash Unix socket 路径必须为绝对路径")
-            return ("unix", unix_path, None), secret
+            # 生成的配置可能记着已失效的临时 socket(Clash Verge 重启后路径会变);
+            # 依次尝试配置路径与服务实际使用的用户级 socket,都存在才继续走 TCP 分支
+            candidates = [unix_path]
+            if hasattr(os, "getuid"):
+                candidates.append(
+                    "/var/run/clash-verge-service/users/%d/verge-mihomo.sock" % os.getuid())
+            for candidate in candidates:
+                if os.path.isabs(candidate) and Path(candidate).exists():
+                    return ("unix", candidate, None), secret
         endpoint = read_yaml_scalar(path, "external-controller")
         if endpoint:
             if not endpoint.startswith(("http://", "https://")):
@@ -424,7 +432,7 @@ def write_changes(changes):
             if path.exists():
                 staged[path].chmod(path.stat().st_mode & 0o777)
         for path, temp in staged.items():
-            temp.replace(path)
+            os.replace(temp, path)
             replaced.append(path)
     except OSError:
         for path in reversed(replaced):
@@ -479,6 +487,10 @@ def main():
         return 0
     if action == "assess" and len(sys.argv) == 9:
         print(assess_probe(policy, *sys.argv[6:9]))
+        return 0
+    if action == "mode":
+        base, secret = controller_config(clash_dir)
+        print(str(api_get(base, secret, "/configs").get("mode", "")).lower())
         return 0
     if not group or any(char in group for char in ",\r\n"):
         fail("代理组名为空或包含规则分隔符")
@@ -596,6 +608,8 @@ clash_rules() {
 # 只接受运行中内核加载的规则，不再用配置文本或 fake-ip 代替。
 merge_ok() { clash_rules verify >/dev/null 2>&1; }
 stun_ok() { merge_ok; }
+# 当前 Clash 模式(rule/global/direct);读取失败返回空
+clash_mode() { clash_rules mode 2>/dev/null; }
 
 # 置顶规则行为检测:三个生态域名全部解析到 fake-ip 段(198.18.x.x)即视为已置顶;未命中域名记入 ROUTE_MISSED
 route_ok() {
@@ -676,9 +690,9 @@ check() {
 
     launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || fails="$fails;保镖未运行"
 
-    # 置顶规则:Clash Verge 验证运行内核;其他客户端只看行为检测
+    # 置顶规则:Clash Verge 验证运行内核;全局模式下全部流量走代理,规则不适用;其他客户端只看行为检测
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        merge_ok || fails="$fails;运行中置顶规则未验证"
+        [ "$(clash_mode)" = "global" ] || merge_ok || fails="$fails;运行中置顶规则未验证"
     else
         route_ok || fails="$fails;置顶规则缺失(未命中:${ROUTE_MISSED# })"
     fi
@@ -707,8 +721,31 @@ webrtc_test() {
 
 # 日常检查与修复共用此判断。先确认规则，再允许探测，避免向已知直连路径发包。
 webrtc_status() {
-    local verified result probe_rc assessment
+    local verified result probe_rc assessment mode leak wips w
     if [ "$PROXY_MODE" = "clash-verge" ]; then
+        mode=$(clash_mode)
+        # 全局模式不经过规则匹配,直接按"STUN 结果是否等于当前出口"判断
+        if [ "$mode" = "global" ]; then
+            result=$(webrtc_test)
+            probe_rc=$?
+            [ "$probe_rc" -ne 0 ] && { echo "fail:STUN 探测执行失败，未确认 UDP 出口"; return; }
+            case "$result" in
+                RESULT:NONE) echo "warn:UDP 无响应,全局模式下无法验证(可能已被节点拦截)" ;;
+                RESULT:*)
+                    leak=""
+                    wips=${result#RESULT:}
+                    OLDIFS=$IFS; IFS=','
+                    for w in $wips; do [ -n "$1" ] && [ "$w" != "$1" ] && leak="$leak $w"; done
+                    IFS=$OLDIFS
+                    if [ -n "$leak" ]; then
+                        echo "fail:暴露非代理IP:${leak# }"
+                    else
+                        echo "ok:仅暴露代理出口IP(全局模式)"
+                    fi ;;
+                *) echo "fail:STUN 探测结果格式异常" ;;
+            esac
+            return
+        fi
         if ! verified=$(clash_rules verify 2>&1); then
             echo "fail:运行规则未验证:${verified#FAIL:}"
             return
@@ -780,9 +817,11 @@ checkdetail() {
     else
         echo '保镖=fail:未安装'
     fi
-    # 置顶规则:Clash Verge 配置/行为双保险,其他客户端只看行为
+    # 置顶规则:Clash Verge 验证运行内核;全局模式下规则不适用(全部流量已走代理)
     if [ "$PROXY_MODE" = "clash-verge" ]; then
-        if merge_ok; then
+        if [ "$(clash_mode)" = "global" ]; then
+            echo '规则置顶=ok:全局模式(全部流量走代理)'
+        elif merge_ok; then
             echo '规则置顶=ok'
         else
             echo '规则置顶=fail:未生效'
@@ -928,8 +967,10 @@ ASEOF
         echo "FIX:地区格式 → $LOCALE_TARGET ✓"
     fi
 
-    # B2. 更新全局脚本并检查运行规则;写入失败或未加载均不能报成功。
-    if [ "$PROXY_MODE" = "clash-verge" ]; then
+    # B2. 更新全局脚本并检查运行规则;写入失败或未加载均不能报成功。全局模式下规则不适用。
+    if [ "$PROXY_MODE" = "clash-verge" ] && [ "$(clash_mode)" = "global" ]; then
+        echo "FIX:全局模式,置顶规则不适用(全部流量已走代理) ✓"
+    elif [ "$PROXY_MODE" = "clash-verge" ]; then
         echo "FIX:写入全局扩展脚本(保留已有 main 与无关配置)..."
         local rules_result
         if ! rules_result=$(write_merge_rules 2>&1); then
