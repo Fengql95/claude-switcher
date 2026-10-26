@@ -190,6 +190,20 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 该体检不阻断启动，也不修改系统；如需彻底隐藏字体特征，可在「字体册」里停用可疑字体。
 
+## 安全打开链接（open-safe，macOS）
+
+邮件里的验证链接、Magic Link、来路不明的登录链接，可以用一次性隔离浏览器打开：
+
+```bash
+~/.local/bin/claude-switch.sh open-safe "https://example.com/magic-link?token=..."
+```
+
+- 使用独立临时 Chrome/Chromium/Edge/Brave profile：**不继承日常浏览器的 cookies、历史、插件和登录态**
+- 强制 `disable_non_proxied_udp`（WebRTC 不走非代理 UDP），语言跟随当前锁定地区
+- 打开前检查代理/TUN 是否就绪，未就绪直接拒绝，避免裸连
+- 只接受 `http/https`；窗口关闭后临时 profile 自动销毁
+- **注意**：该窗口里的登录会话会随窗口关闭一起丢弃；如果链接需要保留登录，请在确认可信后改用日常浏览器
+
 ## 账号快照加密导出（macOS）
 
 换机、重装系统或防灾难时，可以把已保存的账号快照导出为 **AES-256 加密镜像**，在另一台 Mac 上导入：

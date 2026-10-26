@@ -1211,6 +1211,46 @@ fingerprint() {
 }
 
 # 账号快照加密导出/导入(macOS):AES-256 加密 DMG,密码只经 stdin 传递
+# 一次性隔离浏览器:独立临时 profile,禁用非代理 UDP,关闭后销毁;URL 仅允许 http/https
+open_safe() {
+    url="${1:-}"
+    case "$url" in
+        http://*|https://*) ;;
+        '') echo "FAIL:用法: claude-switch.sh open-safe <http(s)://链接>"; return 1 ;;
+        *) echo "FAIL:只允许 http/https 链接"; return 1 ;;
+    esac
+    if [ "${CLAUDE_SWITCHER_SKIP_NET_CHECK:-0}" != "1" ] && ! tun_up && ! proxy_alive; then
+        echo "FAIL:代理未就绪(TUN 未接管且客户端未运行),拒绝打开以免直连"
+        return 1
+    fi
+    chrome="${CLAUDE_SWITCHER_CHROME:-}"
+    if [ -z "$chrome" ]; then
+        for c in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+                 "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+                 "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \
+                 "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"; do
+            [ -x "$c" ] && chrome="$c" && break
+        done
+    fi
+    [ -n "$chrome" ] && [ -x "$chrome" ] || { echo "FAIL:未找到 Chrome/Chromium/Edge/Brave"; return 1; }
+
+    profile=$(mktemp -d "${TMPDIR:-/tmp}/claude-switcher-safe.XXXXXX") || { echo "FAIL:无法创建临时 profile"; return 1; }
+    chmod 700 "$profile"
+    lang="${LOCALE_TARGET:-en_US}"; lang="${lang/_/-}"
+    nohup "$chrome" \
+        --user-data-dir="$profile" \
+        --no-first-run --no-default-browser-check \
+        --disable-sync --disable-extensions \
+        --force-webrtc-ip-handling-policy=disable_non_proxied_udp \
+        --lang="$lang" \
+        "$url" >/dev/null 2>&1 &
+    pid=$!
+    nohup bash -c 'while kill -0 "$1" 2>/dev/null; do sleep 5; done; rm -rf "$2"' _ "$pid" "$profile" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    echo "OK:已在一次性隔离浏览器打开(profile 将在窗口关闭后销毁)"
+    echo "INFO:该窗口不继承你日常浏览器的 cookies/插件;在其中登录产生的会话会随窗口关闭一并丢弃"
+}
+
 snapshot_export() {
     target="${1:-}"; out="${2:-}"; mode="${3:-}"
     case "$target" in A|B) ;; *) echo "FAIL:账号必须是 A 或 B"; return 1 ;; esac
@@ -1466,9 +1506,10 @@ case "${1:-}" in
     set-region) set_region ;;
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
+    open-safe) open_safe "${2:-}" ;;
     snapshot-export) snapshot_export "${2:-}" "${3:-}" "${4:-}" ;;
     snapshot-import) snapshot_import "${2:-}" "${3:-}" "${4:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B> <file>|snapshot-import <file> <A|B>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B> <file>|snapshot-import <file> <A|B>|open-safe <url>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
