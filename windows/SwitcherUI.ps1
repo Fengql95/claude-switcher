@@ -111,10 +111,18 @@ function Set-Status($text, $color) {
 }
 
 function Invoke-Core([string[]]$coreArgs) {
-    # checkdetail 改从落盘的 last-check.txt(UTF-8)读取:子进程 stdout 经控制台代码页(如 GBK/936)转码会把中文键名弄乱,导致 14 项只匹配 3 项
+    # checkdetail/fix 改从落盘的 UTF-8 文件读取:子进程 stdout 经控制台代码页(如 GBK/936)转码会把中文弄乱
     if ($coreArgs[0] -eq 'checkdetail') {
         & powershell -NoProfile -ExecutionPolicy Bypass -File $CORE @coreArgs 2>$null | Out-Null
         return ((Get-Content "$BASE\last-check.txt" -Encoding UTF8) -join "`n").Trim()
+    }
+    if ($coreArgs[0] -eq 'fix') {
+        Remove-Item -LiteralPath "$BASE\last-fix.txt" -Force -ErrorAction SilentlyContinue
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $CORE @coreArgs 2>$null | Out-Null
+        if (Test-Path -LiteralPath "$BASE\last-fix.txt") {
+            return ((Get-Content "$BASE\last-fix.txt" -Encoding UTF8) -join "`n").Trim()
+        }
+        return ''
     }
     $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $CORE @coreArgs 2>$null
     return ($out | Out-String).Trim()
@@ -186,7 +194,7 @@ function Get-UiVersion {
     $vf = Join-Path $BASE 'version.txt'
     if (Test-Path -LiteralPath $vf) {
         try {
-            $raw = Get-Content -LiteralPath $vf -Raw -ErrorAction Stop
+            $raw = Get-Content -LiteralPath $vf -Raw -Encoding UTF8 -ErrorAction Stop
             if ($null -ne $raw) {
                 $v = ([string]$raw).Trim()
                 if ($v) { return $v }
@@ -341,8 +349,20 @@ $win.FindName('BtnFix').Add_Click({
     Set-Status '修复中' ([System.Windows.Media.Color]::FromRgb(0xFB,0x92,0x3C))
     $win.FindName('Banner').Text = '正在修复…（会弹出管理员授权框）'
     $win.Dispatcher.Invoke([action]{}, 'Render')
-    Invoke-Core @('fix') | Out-Null
+    $fixOut = Invoke-Core @('fix')
     Refresh-Checks
+    $ruleLine = $fixOut -split "`n" | Where-Object { $_ -match '^FIX:.*(FAIL|✗|无法|未恢复|未完全|未找到)' } | Select-Object -Last 1
+    if (-not $ruleLine) {
+        $ruleLine = $fixOut -split "`n" | Where-Object { $_ -match '^FIX:.*(模式|规则|TUN)' } | Select-Object -Last 1
+    }
+    if ($ruleLine) {
+        $win.FindName('Banner').Text = $ruleLine.Trim()
+        if ($ruleLine -match 'FAIL|✗|无法|未恢复|未完全|未找到') {
+            $win.FindName('Banner').Foreground = (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0xF8,0x71,0x71)))
+        } else {
+            $win.FindName('Banner').Foreground = (New-Object System.Windows.Media.SolidColorBrush ([System.Windows.Media.Color]::FromRgb(0x60,0xA5,0xFA)))
+        }
+    }
 })
 $win.FindName('BtnA').Add_Click({ Switch-To 'A' })
 $win.FindName('BtnB').Add_Click({ Switch-To 'B' })

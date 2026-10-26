@@ -39,6 +39,82 @@ def update_now_body():
     return text[start:end]
 
 
+def ps1_balance_error(text):
+    """忽略字符串/注释/here-string 后的括号与引号平衡检查。"""
+    i = 0
+    n = len(text)
+    stack = []
+    line = 1
+    in_single = in_double = False
+    here = None
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            line += 1
+        if here:
+            if c == "\n":
+                k = i + 1
+                while k < n and text[k] in " \t":
+                    k += 1
+                if text.startswith(here, k):
+                    i = k + len(here)
+                    line += 1
+                    here = None
+                    continue
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if text.startswith('@"', i) and (i + 2 >= n or text[i + 2] in " \t\r\n"):
+                here = '"@'
+                i += 2
+                continue
+            if text.startswith("@'", i) and (i + 2 >= n or text[i + 2] in " \t\r\n"):
+                here = "'@"
+                i += 2
+                continue
+            if text.startswith("<#", i):
+                j = text.find("#>", i + 2)
+                if j < 0:
+                    return f"line {line}: unclosed block comment"
+                line += text.count("\n", i, j)
+                i = j + 2
+                continue
+            if c == "#":
+                j = text.find("\n", i)
+                i = n if j < 0 else j
+                continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if in_single or in_double:
+            if c == "`" and in_double:
+                i += 2
+                continue
+            i += 1
+            continue
+        if c == "{":
+            stack.append(line)
+        elif c == "}":
+            if not stack:
+                return f"line {line}: unmatched }}"
+            stack.pop()
+        i += 1
+    if here:
+        return "unclosed here-string"
+    if in_single:
+        return "unclosed single quote"
+    if in_double:
+        return "unclosed double quote"
+    if stack:
+        return f"unclosed {{ from line {stack[-1]}"
+    return None
+
+
 class WindowsUpdateStaticTests(unittest.TestCase):
     def test_ps1_files_keep_utf8_bom(self):
         for path in PS1_FILES:
@@ -192,9 +268,9 @@ class WindowsUpdateStaticTests(unittest.TestCase):
 
     def test_ps1_braces_balanced(self):
         for path in PS1_FILES:
-            text = re.sub(r'@"[\s\S]*?"@', '""', read(path))
+            error = ps1_balance_error(read(path))
             with self.subTest(path=path.name):
-                self.assertEqual(text.count("{"), text.count("}"), path.name)
+                self.assertIsNone(error, f"{path.name}: {error}")
 
 
 if __name__ == "__main__":
