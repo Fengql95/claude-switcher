@@ -29,7 +29,7 @@ class MenuBarModelTests(unittest.TestCase):
         cls.addClassCleanup(cls.build.cleanup)
         cls.binary = Path(cls.build.name) / "MenuBarModelTests"
         result = subprocess.run(
-            ["swiftc", "-parse-as-library", "-D", "CLAUDE_SWITCHER_TESTS",
+            ["swiftc", "-parse-as-library", "-warnings-as-errors", "-D", "CLAUDE_SWITCHER_TESTS",
              "-target", f"{platform.machine()}-apple-macos13.0",
              "-module-cache-path", str(Path(cls.build.name) / "module-cache"),
              str(PROJECT / "app/main.swift"),

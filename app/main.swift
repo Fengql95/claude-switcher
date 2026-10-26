@@ -263,7 +263,7 @@ final class VM: ObservableObject {
     private func performSwitch(_ target: String) {
         phase = .switching
         banner = "正在切换到账号 \(target)…"
-        run(["switch", target], timeout: operationTimeout) { result in
+        run(["switch", target], timeout: operationTimeout) { [self] result in
             let lines = result.output.split(separator: "\n").map(String.init)
             let failure = lines.first { $0.hasPrefix("FAIL:") }
             let success = lines.contains { $0.hasPrefix("OK:") || $0.hasPrefix("INFO:") }
