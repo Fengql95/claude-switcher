@@ -118,6 +118,22 @@ function Test-WebRTC($exitIp) {
     return @{ code = 'ok'; detail = '仅暴露代理IP' }
 }
 
+function Find-ClashVerge {
+    # 优先取正在运行进程的真实路径(最可靠),再回退到常见安装目录
+    $running = Get-Process -Name 'clash-verge','Clash Verge' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path } | Select-Object -First 1
+    if ($running) { return $running.Path }
+    $roots = @("$env:LOCALAPPDATA\Programs", $env:ProgramFiles,
+               [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'))
+    foreach ($root in $roots) {
+        if (-not $root) { continue }
+        $hit = Get-ChildItem $root -Recurse -Filter "Clash Verge*.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
+
 function Test-RulesPinned { (Test-Path "$CLASH_DIR\clash-verge.yaml") -and (Select-String -Path "$CLASH_DIR\clash-verge.yaml" -Pattern "DOMAIN-SUFFIX,claude.ai,$PROXY_GROUP" -Quiet) -and (Select-String -Path "$CLASH_DIR\clash-verge.yaml" -Pattern "DST-PORT,3478," -Quiet) }
 
 function Invoke-CheckDetail {
@@ -185,8 +201,8 @@ function Invoke-Fix {
     if ($PROXY_MODE -eq 'clash-verge') {
         if (-not (Test-ProxyAlive)) {
             "FIX:正在启动 Clash Verge..."
-            $cv = Get-ChildItem "$env:LOCALAPPDATA\Programs","$env:ProgramFiles","${env:ProgramFiles(x86)}" -Recurse -Filter "Clash Verge*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($cv) { Start-Process $cv.FullName } else { "FIX:未找到 Clash Verge 可执行文件,请手动启动" }
+            $cv = Find-ClashVerge
+            if ($cv) { Start-Process $cv } else { "FIX:未找到 Clash Verge 可执行文件,请手动启动" }
         }
         $ok = $false
         for ($i = 0; $i -lt 40; $i++) { if ((Test-ProxyAlive) -and (Test-TunUp)) { $ok = $true; break }; Start-Sleep 1 }
@@ -246,10 +262,14 @@ prepend-rules:
 "@
         New-Item -ItemType Directory -Force -Path "$CLASH_DIR\profiles" | Out-Null
         $merge | Out-File -Encoding utf8 "$CLASH_DIR\profiles\Merge.yaml"
-        Get-Process -Name 'clash-verge','Clash Verge' -ErrorAction SilentlyContinue | Stop-Process -Force
-        Start-Sleep 2
-        $cv = Get-ChildItem "$env:LOCALAPPDATA\Programs" -Recurse -Filter "Clash Verge*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($cv) { Start-Process $cv.FullName }
+        $cv = Find-ClashVerge
+        if ($cv) {
+            Get-Process -Name 'clash-verge','Clash Verge' -ErrorAction SilentlyContinue | Stop-Process -Force
+            Start-Sleep 2
+            Start-Process $cv
+        } else {
+            "FIX:未找到 Clash Verge 可执行文件,跳过自动重启;请手动重启它以应用规则"
+        }
         for ($i = 0; $i -lt 40; $i++) { if (Test-TunUp) { break }; Start-Sleep 1 }
         if (Test-RulesPinned) { "FIX:置顶规则 ✓" } else { "FIX:置顶规则 ✗(请重启 Clash Verge)" }
     }
