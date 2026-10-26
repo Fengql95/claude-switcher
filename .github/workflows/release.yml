@@ -30,7 +30,7 @@ jobs:
               exit 1
               ;;
           esac
-          echo "version=$VERSION" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Verify source checksums
