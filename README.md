@@ -261,6 +261,20 @@ skills/
 - 只接受 `http/https`；窗口关闭后临时 profile 自动销毁
 - **注意**：该窗口里的登录会话会随窗口关闭一起丢弃；如果链接需要保留登录，请在确认可信后改用日常浏览器
 
+## 更换代理客户端（macOS）
+
+安装时选错了客户端、或后来从 Clash Verge 换到 Shadowrocket 等，不需要重装：
+
+```bash
+~/.local/bin/claude-switch.sh set-client shadowrocket
+```
+
+支持 `clash-verge|shadowrocket|sing-box|clashx|surge|auto`。改完重新跑一次 `checkdetail` 即可：
+
+- 换成 Shadowrocket 后，「代理内核」检查 `scutil --nc` 的连接状态，不再去找 Clash Verge
+- 非 Clash 客户端不做配置改写，「规则置顶」改用 fake-ip 行为检测；不通过时按提示在客户端里手动添加 Claude 域名规则
+- 如果「保镖在线」是红的，再跑一次 `fix`（需要一次管理员授权）安装守护进程
+
 ## 账号快照加密导出（macOS）
 
 换机、重装系统或防灾难时，可以把已保存的账号快照导出为 **AES-256 加密镜像**，在另一台 Mac 上导入：

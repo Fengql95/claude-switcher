@@ -1020,6 +1020,29 @@ ASEOF
     return "$fix_failed"
 }
 
+# 更换代理客户端:改写已安装脚本头部的 PROXY_MODE(用于安装后换客户端/装错客户端)
+set_client() {
+    mode="${1:-}"
+    case "$mode" in
+        clash-verge|shadowrocket|sing-box|clashx|surge|auto) ;;
+        *) echo "FAIL:用法: claude-switch.sh set-client <clash-verge|shadowrocket|sing-box|clashx|surge|auto>"; return 1 ;;
+    esac
+    target="${CLAUDE_SWITCHER_CORE:-}"
+    if [ -z "$target" ]; then
+        if [ -f "$HOME/.local/bin/claude-switch.sh" ] && [ -w "$HOME/.local/bin/claude-switch.sh" ]; then
+            target="$HOME/.local/bin/claude-switch.sh"
+        else
+            target="$0"
+        fi
+    fi
+    [ -f "$target" ] && [ -w "$target" ] || { echo "FAIL:找不到可写的核心脚本: $target"; return 1; }
+    sed -i '' "s|^PROXY_MODE=\"[^\"]*\"|PROXY_MODE=\"$mode\"|" "$target" || { echo "FAIL:写入失败"; return 1; }
+    grep -q "^PROXY_MODE=\"$mode\"" "$target" || { echo "FAIL:校验失败"; return 1; }
+    echo "OK:代理客户端已设为 $mode"
+    echo "INFO:重新运行 checkdetail 生效;非 Clash 客户端请在应用内自行添加 Claude 域名置顶规则"
+    return 0
+}
+
 # 地区自适应:按当前出口国家一键重设 国家/时区/地区格式(换了国家节点后运行)
 set_region() {
     trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
@@ -1693,6 +1716,7 @@ case "${1:-}" in
     status) status ;;
     switch) switch_to "${2:-}" ;;
     set-region) set_region ;;
+    set-client) set_client "${2:-}" ;;
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     open-safe) open_safe "${2:-}" ;;
@@ -1701,5 +1725,5 @@ case "${1:-}" in
     snapshot-import) snapshot_import "${2:-}" "${3:-}" "${4:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|C|D|set-region|set-client <mode>|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B|C|D> <file>|snapshot-import <file> <A|B|C|D>|open-safe <url>|cli-info|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
