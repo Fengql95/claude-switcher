@@ -1,6 +1,6 @@
 #!/bin/bash
 # Claude 账号切换器 - 核心脚本 (通用版)
-# 用法: claude-switch.sh check | status | switch A|B | checkdetail | fix | set-region | update [--auto] | diagnose-proxy
+# 用法: claude-switch.sh check | status | switch A|B | checkdetail | fix | set-region | update [--check|--auto] | diagnose-proxy
 set -u
 export LC_ALL=en_US.UTF-8
 
@@ -1069,9 +1069,14 @@ ASEOF
     echo "OK:region=$loc tz=$ntz locale=$nlocale"
 }
 
-# 自动更新:拉取 main 分支最新代码,SHA256 校验+配置注入+自检+失败回滚(--auto 供 LaunchAgent 每12小时调用)
+# 自动更新:拉取 main 分支最新代码,SHA256 校验+配置注入+自检+失败回滚
+# --check 只检查不写入;--auto 供 LaunchAgent 每12小时调用(静默写 update.log)
 self_update() {
-    if [ "${1:-}" = "--auto" ]; then auto=1; else auto=0; fi
+    auto=0; check=0
+    case "${1:-}" in
+        --auto) auto=1 ;;
+        --check) check=1 ;;
+    esac
     # 路径全部从脚本自身位置推导,兼容旧版 LaunchDaemon(root) 混跑时 $HOME 不可靠的场景
     BIN=$(cd "$(dirname "$0")" && pwd)
     UHOME="${BIN%/.local/bin}"
@@ -1113,6 +1118,14 @@ self_update() {
     if [ -f "$BIN/claude-switch.sh" ] && \
        diff <(strip_cfg "$BIN/claude-switch.sh") <(strip_cfg "$NEW/core/claude-switch.sh") >/dev/null 2>&1; then
         echo "OK:已是最新版本"; rm -rf "$tmpd"; return 0
+    fi
+
+    # 只读检查:不备份、不写文件、不物化守护脚本、不触发自检/回滚
+    if [ "$check" -eq 1 ]; then
+        stamp=$(stat -f '%Sm' -t '%Y-%m-%d' "$NEW/core/claude-switch.sh" 2>/dev/null)
+        [ -z "$stamp" ] && stamp=$(date '+%F')
+        echo "INFO:发现新版本 $stamp"
+        rm -rf "$tmpd"; return 0
     fi
 
     # 备份现有核心脚本
@@ -1343,7 +1356,8 @@ case "${1:-}" in
     switch) switch_to "${2:-}" ;;
     set-region) set_region ;;
     update) self_update "${2:-}" ;;
+    update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--auto]|fingerprint|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--check|--auto]|update-check|fingerprint|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac

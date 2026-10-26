@@ -66,12 +66,15 @@ final class VM: ObservableObject {
     @Published var fingerprint = ""
     @Published private(set) var isBusy = false
     @Published private(set) var lastCheckSummary = "尚未检查"
+    @Published var updateText = ""
+    @Published var showUpdateSheet = false
 
     let core: String
     private let checkTimeout: TimeInterval
     private let operationTimeout: TimeInterval
     private var started = false
     private var switchRequested = false
+    private var checkingUpdate = false
     private var hideAfterSwitch: DispatchWorkItem?
     var onSwitchCompleted: (() -> Void)?
 
@@ -245,6 +248,41 @@ final class VM: ObservableObject {
         }
     }
 
+    func checkUpdate() {
+        guard !checkingUpdate else { return }
+        checkingUpdate = true
+        updateText = "正在检查更新…"
+        run(["update-check"], timeout: 120) { result in
+            self.updateText = result.output.isEmpty
+                ? (result.succeeded ? "检查完成，核心脚本没有返回结果" : "检查失败，请重试")
+                : result.output
+            self.checkingUpdate = false
+        }
+    }
+
+    var aiPrompt: String {
+        let home = NSHomeDirectory()
+        let agents = home + "/.claude-switcher/AGENTS.md"
+        let agentsLine = FileManager.default.fileExists(atPath: agents)
+            ? "本机交接文档：\(agents)"
+            : "本机交接文档：\(agents)（~/.claude-switcher 不存在或其中没有 AGENTS.md，请从仓库根目录读取 AGENTS.md）"
+        return """
+        这是「Claude 切换器」的 AI 交接提示词。请先完整阅读交接文档，再开始安装、配置或排障。
+
+        仓库地址：https://github.com/YOURSJEYO/claude-switcher
+        \(agentsLine)
+
+        执行要求：
+        1. 先读 AGENTS.md，按其中的安装步骤、验收标准与安全红线执行，不要只凭本段提示词猜测。
+        2. 安装或排障时先跑环境审计：14 项检查全部通过才算就绪；任何一项不过都不要启动 Claude。
+        3. 账号切换前先完全退出 Claude；账号快照按 AGENTS.md 的规则保留，不要改动 ~/.claude-switcher/accounts/ 的结构。
+        4. 保镖等常驻脚本只放在 root 所有的系统目录，不要改回用户可写路径；需要变更时引导我重跑安装器。
+        5. 不要未经我明确同意更新、覆盖或重装已安装版本（~/.local/bin、桌面 App、launchd 与系统目录），也不要执行 update 或安装器；先说明影响并征得同意。
+        6. 检查新版本只运行 `~/.local/bin/claude-switch.sh update-check`，看到结果后先问我是否执行更新。
+        7. 不要在日志、文档或回复里暴露我的出口 IP、代理地址或任何凭据。
+        """
+    }
+
     func switchTo(_ target: String) {
         guard !isBusy, ["A", "B"].contains(target) else { return }
         hideAfterSwitch?.cancel()
@@ -300,6 +338,7 @@ struct ContentView: View {
     var height: CGFloat = 860
     @State private var showNotice = false
     @State private var showFingerprint = false
+    @State private var showAIPrompt = false
 
     var body: some View {
         ZStack {
@@ -318,6 +357,7 @@ struct ContentView: View {
             }
             .padding(20)
         }
+        .sheet(isPresented: $showAIPrompt) { AIPromptSheet(text: vm.aiPrompt) }
         .frame(width: 440, height: height)
     }
 
@@ -510,11 +550,26 @@ struct ContentView: View {
     }
 
     var footer: some View {
-        HStack {
+        HStack(spacing: 10) {
             Image(systemName: "lock.shield").font(.caption2)
             Text("任何一项检查不过，都不会启动 Claude").font(.caption2)
+            Spacer()
+            Button {
+                vm.checkUpdate()
+                vm.showUpdateSheet = true
+            } label: {
+                Text("检查更新").font(.caption2).foregroundColor(.white.opacity(0.55))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("检查更新")
+            Button { showAIPrompt = true } label: {
+                Text("AI 配置").font(.caption2).foregroundColor(.white.opacity(0.55))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("AI 配置")
         }
         .foregroundColor(.white.opacity(0.35))
+        .sheet(isPresented: $vm.showUpdateSheet) { UpdateSheet(vm: vm) }
     }
 }
 
@@ -544,6 +599,146 @@ struct FingerprintView: View {
         .padding(20)
         .frame(width: 520, height: 420)
         .background(Color(red: 0.07, green: 0.08, blue: 0.13))
+    }
+}
+
+// MARK: - 版本更新
+
+struct UpdateSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var vm: VM
+    @State private var copied = false
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.07, green: 0.08, blue: 0.13), Color(red: 0.10, green: 0.07, blue: 0.16)],
+                           startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("版本更新").font(.title3.bold()).foregroundColor(.white)
+                        Text("只检查，不写入任何文件").font(.caption).foregroundColor(.white.opacity(0.5))
+                    }
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(.white.opacity(0.4))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭")
+                }
+
+                ScrollView {
+                    Text(vm.updateText.isEmpty ? "尚未检查" : vm.updateText)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.9))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(12)
+                .frame(height: 110)
+                .background(Color.white.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.08)))
+
+                HStack(spacing: 10) {
+                    Button { vm.checkUpdate() } label: {
+                        Label("重新检查", systemImage: "arrow.clockwise")
+                            .font(.callout.bold())
+                            .padding(.horizontal, 16).padding(.vertical, 7)
+                            .background(LinearGradient(colors: [Color.indigo, Color.purple], startPoint: .leading, endPoint: .trailing))
+                            .foregroundColor(.white)
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    Button { copyUpdateCommand() } label: {
+                        Label(copied ? "已复制" : "复制更新命令", systemImage: copied ? "checkmark" : "doc.on.doc")
+                            .font(.callout.bold())
+                            .padding(.horizontal, 16).padding(.vertical, 7)
+                            .background(Color.white.opacity(0.1))
+                            .foregroundColor(.white)
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                }
+
+                Text("复制后到终端执行即可更新；更新前会做 SHA256 校验，自检不通过会自动回滚。")
+                    .font(.caption2).foregroundColor(.white.opacity(0.4))
+            }
+            .padding(20)
+        }
+        .frame(width: 520, height: 300)
+    }
+
+    private func copyUpdateCommand() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        _ = pasteboard.setString("~/.local/bin/claude-switch.sh update", forType: .string)
+        copied = true
+    }
+}
+
+// MARK: - AI 交接提示词
+
+struct AIPromptSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let text: String
+    @State private var copied = false
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [Color(red: 0.07, green: 0.08, blue: 0.13), Color(red: 0.10, green: 0.07, blue: 0.16)],
+                           startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AI 交接提示词").font(.title3.bold()).foregroundColor(.white)
+                        Text("复制后粘贴给本地 AI，让它先读 AGENTS.md 再动手").font(.caption).foregroundColor(.white.opacity(0.5))
+                    }
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark.circle.fill").font(.title2).foregroundColor(.white.opacity(0.4))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭")
+                }
+
+                ScrollView {
+                    Text(text)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.9))
+                        .textSelection(.enabled)
+                        .lineSpacing(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(12)
+                .background(Color.white.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.white.opacity(0.08)))
+
+                HStack {
+                    Button { copyPrompt() } label: {
+                        Label(copied ? "已复制" : "复制", systemImage: copied ? "checkmark" : "doc.on.doc")
+                            .font(.callout.bold())
+                            .padding(.horizontal, 18).padding(.vertical, 7)
+                            .background(LinearGradient(colors: [Color.indigo, Color.purple], startPoint: .leading, endPoint: .trailing))
+                            .foregroundColor(.white)
+                            .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                }
+            }
+            .padding(20)
+        }
+        .frame(width: 520, height: 480)
+    }
+
+    private func copyPrompt() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        _ = pasteboard.setString(text, forType: .string)
+        copied = true
     }
 }
 
@@ -698,6 +893,11 @@ struct MenuBarContent: View {
             vm.refresh()
         }
         .disabled(vm.isBusy)
+        Button("检查更新") {
+            showWindow()
+            vm.checkUpdate()
+            vm.showUpdateSheet = true
+        }
         Divider()
         Button("退出 Claude 切换器") { NSApplication.shared.terminate(nil) }
             .keyboardShortcut("q")

@@ -2,11 +2,14 @@
 
 # Claude 切换器
 
+[English](README.en.md) · [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
+
 **Fail-Closed 账号环境管理器 —— 把真实 IP 泄漏拦截在启动之前**
 
 > 🛠️ **本项目持续活跃更新中**——防护项随目标平台风控演进不断增加，见下方[路线图](#路线图)。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/YOURSJEYO/claude-switcher?label=release&color=blue)](https://github.com/YOURSJEYO/claude-switcher/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-macOS-blue.svg)]()
 [![Windows](https://img.shields.io/badge/Windows-Beta-lightgrey.svg)](windows/)
 [![Linux](https://img.shields.io/badge/Linux-Beta-lightgrey.svg)](linux/)
@@ -18,6 +21,10 @@
 </div>
 
 ---
+
+## 用途声明
+
+本项目用于在合规地区管理多个 Claude 账号的本地环境与登录态，面向因出差、旅居等原因身处支持地区的用户。请遵守 Anthropic 服务条款；禁止用于账号转售、共享、代注册或规避地区限制。本地环境检查只影响本机配置，不改变服务端记录，也不构成账号不被限制的保证。
 
 ## 为什么做这个
 
@@ -97,6 +104,18 @@ AI 服务平台的风控已经从"看 IP"进化到**全维度环境画像**：�
 
 > **Windows 用户**：[`windows/`](windows/) 目录提供 Windows 版（PowerShell + WPF，Beta），安装与注意事项见 [windows/README.md](windows/README.md)。
 > **Linux 用户**：[`linux/`](linux/) 目录提供 Linux 版（bash + systemd，Beta），设计取舍（无官方桌面版→切换浏览器登录态）见 [linux/README.md](linux/README.md)。
+
+### 直接下载（推荐）
+
+到 [Releases](https://github.com/YOURSJEYO/claude-switcher/releases/latest) 下载最新版本，按用途选择：
+
+- `ClaudeSwitcher-<版本>-installer-kit.zip`：**首次安装推荐**。解压后双击 `installer/安装.command`，安装核心脚本、守护进程与桌面 App。
+- `ClaudeSwitcher-<版本>-macos-arm64.dmg` / `.zip`：仅包含 macOS 界面 App；核心脚本已安装时可用于替换旧版界面。
+- `ClaudeSwitcher-<版本>-windows.zip` / `ClaudeSwitcher-<版本>-linux.tar.gz`：Windows / Linux 脚本包（Beta），说明见各自目录的 README。
+
+> macOS 产物为 ad-hoc 签名、未公证。首次打开若被 Gatekeeper 拦截，请右键打开，或在「系统设置 → 隐私与安全性」中放行。每个 Release 附带 `SHA256SUMS-release.txt`，可用 `shasum -a 256 -c` 校验下载文件。
+
+### 从源码安装
 
 ```bash
 # 克隆后双击 installer/安装.command 即可,自动识别代理客户端、代理组名与地区目标
