@@ -190,6 +190,24 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 该体检不阻断启动，也不修改系统；如需彻底隐藏字体特征，可在「字体册」里停用可疑字体。
 
+## Claude Code CLI 体检（macOS）
+
+桌面版内置的 CLI 和自己用 npm/Homebrew 装的 CLI 经常版本不一致，或 PATH 里指向了旧版。只读检查：
+
+```bash
+~/.local/bin/claude-switch.sh cli-info
+```
+
+输出包含：
+
+- PATH 中的 `claude` 路径、解析后的真实路径、`--version`
+- 安装方式推断（native / Homebrew / npm·bun / 未知）
+- 桌面版内置 CLI 的版本（`~/Library/Application Support/Claude/claude-code/...`）
+- 是否同时存在 npm 全局包与 Homebrew 包（多份安装容易互相覆盖）
+- `~/.claude` 配置目录是否存在及体积
+
+该命令**只检测不修改**：不会卸载、升级或删除任何东西；需要重装时按输出里的建议自行执行对应包管理器命令。
+
 ## 安全打开链接（open-safe，macOS）
 
 邮件里的验证链接、Magic Link、来路不明的登录链接，可以用一次性隔离浏览器打开：

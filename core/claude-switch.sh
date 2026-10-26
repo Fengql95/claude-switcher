@@ -1212,6 +1212,58 @@ fingerprint() {
 
 # 账号快照加密导出/导入(macOS):AES-256 加密 DMG,密码只经 stdin 传递
 # 一次性隔离浏览器:独立临时 profile,禁用非代理 UDP,关闭后销毁;URL 仅允许 http/https
+# Claude Code CLI 体检:只读检测安装方式/版本/多份安装冲突,不执行卸载或重装
+cli_info() {
+    echo "# Claude Code CLI 体检 $(date '+%F %T')"
+    path=$(command -v claude 2>/dev/null)
+    if [ -n "$path" ]; then
+        real=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path" 2>/dev/null || echo "$path")
+        ver=$(perl -e 'alarm 4; exec @ARGV' "$real" --version 2>/dev/null | head -1)
+        [ -z "$ver" ] && ver=$(perl -e 'alarm 4; exec @ARGV' "$path" --version 2>/dev/null | head -1)
+        echo "CLI=ok:$path"
+        [ "$real" != "$path" ] && echo "CLI真实路径=info:$real"
+        echo "版本=ok:${ver:-未获取}"
+        case "$real" in
+            *".claude/local"*|*".local/share/claude"*) method="native(官方安装脚本)" ;;
+            *"/opt/homebrew/"*|*"/usr/local/Cellar/"*|*"/home/linuxbrew/"*) method="homebrew" ;;
+            *"node_modules"*|*".npm-global"*|*"/.bun/"*) method="npm/bun" ;;
+            *) method="未知(建议核对 PATH)" ;;
+        esac
+        echo "安装方式=info:$method"
+    else
+        echo "CLI=warn:PATH 中没有 claude 命令"
+        echo "安装方式=info:未安装(桌面版可能自带内置 CLI,见下)"
+    fi
+
+    bundled=$(ls -d "$HOME/Library/Application Support/Claude/claude-code"/* 2>/dev/null | tail -1)
+    if [ -n "$bundled" ]; then
+        echo "桌面版内置=ok:$(basename "$bundled")"
+    else
+        echo "桌面版内置=info:未发现(Claude 桌面版未安装或版本较旧)"
+    fi
+
+    if command -v npm >/dev/null 2>&1 && npm ls -g --depth=0 @anthropic-ai/claude-code >/dev/null 2>&1; then
+        echo "npm全局包=warn:检测到 @anthropic-ai/claude-code"
+    else
+        echo "npm全局包=ok:未检测到"
+    fi
+    if command -v brew >/dev/null 2>&1 && brew list --versions claude-code >/dev/null 2>&1; then
+        echo "Homebrew包=warn:$(brew list --versions claude-code 2>/dev/null | head -1)"
+    else
+        echo "Homebrew包=ok:未检测到"
+    fi
+
+    cfg="$HOME/.claude"
+    if [ -d "$cfg" ]; then
+        echo "配置目录=ok:$cfg ($(du -sh "$cfg" 2>/dev/null | cut -f1))"
+    else
+        echo "配置目录=info:未创建(尚未运行过 CLI)"
+    fi
+
+    [ -n "$path" ] && echo "建议=info:升级用对应包管理器(brew upgrade claude-code / npm i -g @anthropic-ai/claude-code@latest);卸载前先确认桌面版是否依赖它"
+    return 0
+}
+
 open_safe() {
     url="${1:-}"
     case "$url" in
@@ -1507,9 +1559,10 @@ case "${1:-}" in
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
     open-safe) open_safe "${2:-}" ;;
+    cli-info) cli_info ;;
     snapshot-export) snapshot_export "${2:-}" "${3:-}" "${4:-}" ;;
     snapshot-import) snapshot_import "${2:-}" "${3:-}" "${4:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B> <file>|snapshot-import <file> <A|B>|open-safe <url>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B> <file>|snapshot-import <file> <A|B>|open-safe <url>|cli-info|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
