@@ -190,6 +190,24 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 该体检不阻断启动，也不修改系统；如需彻底隐藏字体特征，可在「字体册」里停用可疑字体。
 
+## 账号快照加密导出（macOS）
+
+换机、重装系统或防灾难时，可以把已保存的账号快照导出为 **AES-256 加密镜像**，在另一台 Mac 上导入：
+
+```bash
+# 导出账号 A(先切换到 B,让 A 完成归档)
+~/.local/bin/claude-switch.sh snapshot-export A ~/Desktop/account-a.dmg
+
+# 在另一台 Mac 导入(目标槽位必须为空)
+~/.local/bin/claude-switch.sh snapshot-import ~/Desktop/account-a.dmg A
+```
+
+- 密码至少 8 位，交互输入两次；脚本内通过 stdin 传给 `hdiutil`，不进入命令行参数或日志
+- 镜像根目录带格式标记，导入时会校验格式与账号槽位；账号不匹配、密码错误、槽位已存在都会拒绝，不会覆盖现有快照
+- **密码无法找回**：忘记密码等于镜像作废，请自行保存在密码管理器里
+- 导入的是本地登录态快照；若服务端会话已过期或被撤销，仍需重新登录
+- 仅 macOS（依赖系统 `hdiutil`）；导出/导入不会修改当前账号，也不会启动或关闭 Claude
+
 ## 已有代理的独立诊断（macOS CLI）
 
 已有 HTTP/SOCKS 入口、由其他工具管理账号时，可以先单独检查 Claude 的网络传输，无需运行安装器或启动 Claude：

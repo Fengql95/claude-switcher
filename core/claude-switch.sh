@@ -1210,6 +1210,115 @@ fingerprint() {
     echo "CanvasWebGL=info:原生检查读不到 Claude Electron 的渲染特征,请打开 Web 检测页 https://yoursjeyo.github.io/claude-switcher/ 查看 Canvas/WebGL 指纹"
 }
 
+# 账号快照加密导出/导入(macOS):AES-256 加密 DMG,密码只经 stdin 传递
+snapshot_export() {
+    target="${1:-}"; out="${2:-}"; mode="${3:-}"
+    case "$target" in A|B) ;; *) echo "FAIL:账号必须是 A 或 B"; return 1 ;; esac
+    [ -d "$BASE/accounts/$target" ] || { echo "FAIL:账号$target 没有已归档快照(先切换一次让它归档)"; return 1; }
+    [ -n "$out" ] || { echo "FAIL:请指定导出文件路径"; return 1; }
+    case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
+    [ -e "$out" ] && { echo "FAIL:目标文件已存在,请换一个路径"; return 1; }
+    if [ "$(cat "$BASE/current" 2>/dev/null)" = "$target" ]; then
+        echo "FAIL:账号$target 正在使用中,当前数据在运行目录;请先切换到另一账号(会自动归档)再导出"
+        return 1
+    fi
+
+    if [ "$mode" = "--password-stdin" ]; then
+        IFS= read -r pass || true
+    else
+        printf '设置导出密码(至少 8 位): '; stty -echo 2>/dev/null; IFS= read -r pass; stty echo 2>/dev/null; echo
+        printf '再次输入: '; stty -echo 2>/dev/null; IFS= read -r pass2; stty echo 2>/dev/null; echo
+        [ "$pass" = "$pass2" ] || { echo "FAIL:两次密码不一致"; return 1; }
+    fi
+    if [ ${#pass} -lt 8 ]; then
+        unset pass pass2
+        echo "FAIL:密码至少 8 位"; return 1
+    fi
+
+    stage=$(mktemp -d)
+    if ! ditto "$BASE/accounts/$target/" "$stage/"; then
+        rm -rf "$stage"; unset pass pass2
+        echo "FAIL:复制快照失败"; return 1
+    fi
+    cat > "$stage/.claude-switcher-snapshot.json" <<EOF
+{"format":"claude-switcher-snapshot","version":1,"account":"$target","created":"$(date '+%F %T')"}
+EOF
+    if ! printf '%s\n' "$pass" | hdiutil create -srcfolder "$stage" -volname "ClaudeSnapshot-$target" \
+        -encryption AES-256 -stdinpass "$out" >/dev/null 2>&1; then
+        rm -rf "$stage"; rm -f "$out"; unset pass pass2
+        echo "FAIL:创建加密镜像失败"; return 1
+    fi
+    rm -rf "$stage"
+    # 加密镜像校验必须带密码,否则 macOS 会弹出图形密码框
+    if ! printf '%s\n' "$pass" | hdiutil verify -stdinpass "$out" >/dev/null 2>&1; then
+        rm -f "$out"; unset pass pass2
+        echo "FAIL:镜像校验失败"; return 1
+    fi
+    unset pass pass2
+    chmod 600 "$out"
+    echo "OK:账号$target 已加密导出到 $out"
+}
+
+snapshot_import() {
+    file="${1:-}"; target="${2:-}"; mode="${3:-}"
+    case "$target" in A|B) ;; *) echo "FAIL:账号必须是 A 或 B"; return 1 ;; esac
+    [ -f "$file" ] || { echo "FAIL:找不到镜像文件: $file"; return 1; }
+    [ -e "$BASE/accounts/$target" ] && { echo "FAIL:账号$target 已有快照,请先导出或删除后再导入"; return 1; }
+
+    if [ "$mode" = "--password-stdin" ]; then
+        IFS= read -r pass || true
+    else
+        printf '输入镜像密码: '; stty -echo 2>/dev/null; IFS= read -r pass; stty echo 2>/dev/null; echo
+    fi
+    [ -n "$pass" ] || { echo "FAIL:密码为空"; return 1; }
+
+    mnt=$(mktemp -d)
+    attached=0
+    if ! printf '%s\n' "$pass" | hdiutil attach -stdinpass -nobrowse -readonly -mountpoint "$mnt" "$file" >/dev/null 2>&1; then
+        unset pass; rm -rf "$mnt"
+        echo "FAIL:密码错误或镜像损坏"; return 1
+    fi
+    attached=1
+    unset pass
+
+    cleanup_import() {
+        [ "$attached" = "1" ] && hdiutil detach "$mnt" >/dev/null 2>&1
+        rm -rf "$mnt" "$BASE/accounts/$target.new"
+    }
+
+    marker="$mnt/.claude-switcher-snapshot.json"
+    if [ ! -f "$marker" ]; then
+        cleanup_import
+        echo "FAIL:不是本项目导出的快照镜像"; return 1
+    fi
+    if ! python3 - "$marker" "$target" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as f: meta = json.load(f)
+assert meta.get("format") == "claude-switcher-snapshot"
+assert meta.get("version") == 1
+assert meta.get("account") in ("A", "B")
+sys.exit(0 if meta.get("account") == sys.argv[2] else 1)
+PY
+    then
+        cleanup_import
+        echo "FAIL:镜像元数据校验失败(账号不匹配或格式不支持)"; return 1
+    fi
+
+    rm -rf "$BASE/accounts/$target.new"
+    if ! ditto "$mnt" "$BASE/accounts/$target.new"; then
+        cleanup_import
+        echo "FAIL:复制到账号目录失败"; return 1
+    fi
+    rm -f "$BASE/accounts/$target.new/.claude-switcher-snapshot.json"
+    chmod 700 "$BASE/accounts/$target.new"
+    if ! mv "$BASE/accounts/$target.new" "$BASE/accounts/$target"; then
+        cleanup_import
+        echo "FAIL:写入账号目录失败"; return 1
+    fi
+    cleanup_import
+    echo "OK:已导入为账号$target(切换时生效)"
+}
+
 status() {
     cur="none"; [ -f "$BASE/current" ] && cur=$(cat "$BASE/current")
     hasA=0; [ -d "$BASE/accounts/A" ] && hasA=1
@@ -1357,7 +1466,9 @@ case "${1:-}" in
     set-region) set_region ;;
     update) self_update "${2:-}" ;;
     update-check) self_update --check ;;  # 只读检查;独立入口,避免旧版核心把 --check 当成真实更新
+    snapshot-export) snapshot_export "${2:-}" "${3:-}" "${4:-}" ;;
+    snapshot-import) snapshot_import "${2:-}" "${3:-}" "${4:-}" ;;
     write-merge-rules) write_merge_rules ;;  # 隐藏入口:供安装器调用,保证两处合并逻辑一致
     fingerprint) fingerprint ;;
-    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--check|--auto]|update-check|fingerprint|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
+    *) echo "用法: claude-switch.sh check|checkdetail|fix|status|switch A|B|set-region|update [--check|--auto]|update-check|fingerprint|snapshot-export <A|B> <file>|snapshot-import <file> <A|B>|diagnose-proxy [--proxy URL|--config FILE]"; exit 2 ;;
 esac
