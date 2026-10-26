@@ -57,6 +57,7 @@ jobs:
           WIN_ROOT="$WORK/ClaudeSwitcher-${VERSION}-windows"
           mkdir -p "$WIN_ROOT"
           ditto windows "$WIN_ROOT/windows"
+          printf '%s\n' "$VERSION" > "$WIN_ROOT/VERSION"
           cp README.md AGENTS.md SECURITY.md LICENSE "$WIN_ROOT/"
           (cd "$WORK" && ditto -c -k --keepParent --norsrc --noextattr \
             "ClaudeSwitcher-${VERSION}-windows" \
