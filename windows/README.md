@@ -60,6 +60,7 @@ TUN 判定顺序：先看是否存在 `198.18.x.x` 假 IP（Clash 系 fake-ip）
 - 界面是 WPF 重写的第一版,样式以 Mac 版为准对齐,细节可能有出入
 - Clash Verge 的 TUN 开关在 Windows 上如果被更新重置,目前需要手动在设置里重新打开(一键修复会提示)
 - 账号快照切换前请确保 Claude 已完全退出(托盘图标也要退出)
+- 如果 Clash 报 `Merge.yaml ... containing more than one document`：说明全局扩展配置里出现了多个 YAML 文档（`---` 分隔符）或重复顶层键。v1.4.2 起「一键修复」会自动检测并重建 Merge.yaml（原文件备份为 `Merge.yaml.bak.<时间戳>`）；手动处理时删除所有 `---` 行、只保留一个 `profile:` 与一个 `prepend-rules:` 即可
 - 「一键修复」在写入置顶规则后会重启 Clash Verge（任务栏/托盘图标会短暂消失，属正常）。新版本会先记录运行中进程的真实路径再重启；找不到可执行文件时不会强行结束它，而是提示手动重启
 - **`auto` / `other` 的 TUN 判定是通用启发式**:只要有一块处于 `Up` 状态、描述里带 `TAP/TUN/WireGuard/Wintun/VPN/Tailscale` 的网卡就会判定 TUN 在线,无法区分"代理隧道已接管"还是"某块虚拟网卡只是存在"。可能误判(例如虚拟网卡残留、其他 VPN 适配器),此时请把 `$PROXY_MODE` 改成实际客户端后重跑安装器;若仍不稳定,可在计划任务中暂停 `ClaudeBodyguard`
 - **非 Clash 客户端**:保镖已按客户端模式分派,不再因缺少 `verge-mihomo` 每 10 秒误杀 Claude;但 `规则置顶` 检查目前只读取 Clash Verge 配置,非 Clash 用户该行可能显示 `fail`,需要自行在客户端里为 `claude.ai` / `anthropic.com` 等域名配置置顶/直连规则。`DNS` 检查也按 `198.18.x.x` 判断,使用非 fake-ip TUN 时可能显示 `fail`,不代表代理不可用

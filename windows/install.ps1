@@ -145,7 +145,7 @@ Write-Host "[OK] 桌面快捷方式已创建" -ForegroundColor Green
 # ---- 6. 置顶规则(仅 Clash Verge) ----
 if ($PROXY_MODE -eq 'clash-verge' -and $CLASH_DIR) {
     New-Item -ItemType Directory -Force -Path "$CLASH_DIR\profiles" | Out-Null
-    @"
+    $merge = @"
 profile:
   store-selected: true
 
@@ -166,7 +166,12 @@ prepend-rules:
   - DST-PORT,3478,$grp
   - DST-PORT,5349,$grp
   - DST-PORT,19302,$grp
-"@ | Out-File -Encoding utf8 "$CLASH_DIR\profiles\Merge.yaml"
+"@
+    $mergePath = "$CLASH_DIR\profiles\Merge.yaml"
+    if (Test-Path $mergePath) {
+        Copy-Item -LiteralPath $mergePath "$mergePath.bak.$((Get-Date).ToString('yyyyMMddHHmmss'))" -Force
+    }
+    [System.IO.File]::WriteAllText($mergePath, $merge.TrimStart([char[]]"`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
     Write-Host "[OK] Claude 域名置顶规则已写入(重启 Clash Verge 后生效)" -ForegroundColor Green
 } elseif ($PROXY_MODE -eq 'clash-verge') {
     Write-Host "[WARN] 未找到 Clash Verge 配置目录,跳过置顶规则;请手动在 Clash Verge 中添加" -ForegroundColor Yellow

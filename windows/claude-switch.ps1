@@ -134,7 +134,24 @@ function Find-ClashVerge {
     return $null
 }
 
-function Test-RulesPinned { (Test-Path "$CLASH_DIR\clash-verge.yaml") -and (Select-String -Path "$CLASH_DIR\clash-verge.yaml" -Pattern "DOMAIN-SUFFIX,claude.ai,$PROXY_GROUP" -Quiet) -and (Select-String -Path "$CLASH_DIR\clash-verge.yaml" -Pattern "DST-PORT,3478," -Quiet) }
+function Test-MergeYamlSingle {
+    # 多文档(---)或重复顶层键都会让 Clash 报 "more than one document"/重复键
+    $path = "$CLASH_DIR\profiles\Merge.yaml"
+    if (-not (Test-Path $path)) { return $true }
+    $lines = @(Get-Content -LiteralPath $path -ErrorAction SilentlyContinue)
+    if ($lines | Where-Object { $_ -match '^\s*---\s*(#.*)?$' }) { return $false }
+    $tops = $lines | Where-Object { $_ -match '^[A-Za-z0-9_.-]+:' } |
+        ForEach-Object { ($_ -split ':', 2)[0] }
+    $dupes = $tops | Group-Object | Where-Object { $_.Count -gt 1 }
+    return -not [bool]$dupes
+}
+
+function Test-RulesPinned {
+    (Test-MergeYamlSingle) -and
+    (Test-Path "$CLASH_DIR\clash-verge.yaml") -and
+    (Select-String -Path "$CLASH_DIR\clash-verge.yaml" -Pattern "DOMAIN-SUFFIX,claude.ai,$PROXY_GROUP" -Quiet) -and
+    (Select-String -Path "$CLASH_DIR\clash-verge.yaml" -Pattern "DST-PORT,3478," -Quiet)
+}
 
 function Invoke-CheckDetail {
     $pname = Get-ProxyName
@@ -261,7 +278,12 @@ prepend-rules:
   - DST-PORT,19302,$PROXY_GROUP
 "@
         New-Item -ItemType Directory -Force -Path "$CLASH_DIR\profiles" | Out-Null
-        $merge | Out-File -Encoding utf8 "$CLASH_DIR\profiles\Merge.yaml"
+        $mergePath = "$CLASH_DIR\profiles\Merge.yaml"
+        if (Test-Path $mergePath) {
+            Copy-Item -LiteralPath $mergePath "$mergePath.bak.$((Get-Date).ToString('yyyyMMddHHmmss'))" -Force
+        }
+        # 明确写 UTF-8 无 BOM、单文档;带 BOM 或多文档都会被 Clash 解析器拒绝
+        [System.IO.File]::WriteAllText($mergePath, $merge.TrimStart([char[]]"`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
         $cv = Find-ClashVerge
         if ($cv) {
             Get-Process -Name 'clash-verge','Clash Verge' -ErrorAction SilentlyContinue | Stop-Process -Force
