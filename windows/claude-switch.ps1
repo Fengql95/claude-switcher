@@ -233,18 +233,21 @@ function Get-YamlScalar([string]$path, [string]$key) {
 
 # 解析 Clash 控制接口;Windows 版不使用 unix socket
 function Get-ClashApi {
-    $yaml = Join-Path $CLASH_DIR 'clash-verge.yaml'
-    $addr = Get-YamlScalar $yaml 'external-controller'
-    if ([string]::IsNullOrWhiteSpace($addr)) { return $null }
-    if ($addr -match '^unix://' -or $addr -match '^/') { return $null }
-    $addr = $addr -replace '^0\.0\.0\.0:', '127.0.0.1:'
-    $addr = $addr -replace '^:', '127.0.0.1:'
-    if ($addr -notmatch '^https?://') { $addr = 'http://' + $addr }
-    $base = $addr.TrimEnd('/')
-    $secret = Get-YamlScalar $yaml 'secret'
-    $headers = @{}
-    if (-not [string]::IsNullOrWhiteSpace($secret)) { $headers['Authorization'] = 'Bearer ' + $secret }
-    return @{ base = $base; headers = $headers }
+    foreach ($name in @('clash-verge.yaml', 'config.yaml')) {
+        $yaml = Join-Path $CLASH_DIR $name
+        $addr = Get-YamlScalar $yaml 'external-controller'
+        if ([string]::IsNullOrWhiteSpace($addr)) { continue }
+        if ($addr -match '^unix://' -or $addr -match '^/') { continue }
+        $addr = $addr -replace '^0\.0\.0\.0:', '127.0.0.1:'
+        $addr = $addr -replace '^:', '127.0.0.1:'
+        if ($addr -notmatch '^https?://') { $addr = 'http://' + $addr }
+        $base = $addr.TrimEnd('/')
+        $secret = Get-YamlScalar $yaml 'secret'
+        $headers = @{}
+        if (-not [string]::IsNullOrWhiteSpace($secret)) { $headers['Authorization'] = 'Bearer ' + $secret }
+        return @{ base = $base; headers = $headers }
+    }
+    return $null
 }
 
 # 返回 global|rule|direct|unknown;API 优先,失败再读 YAML

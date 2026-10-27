@@ -102,6 +102,9 @@ class WindowsRulesStaticTests(unittest.TestCase):
         ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, text)
+        api_body = between(text, "function Get-ClashApi", "function Get-ClashMode")
+        self.assertIn("config.yaml", api_body)
+        self.assertIn("IsNullOrWhiteSpace($addr)", api_body)
         # 中文代理组名/规则不能按 ANSI 读取
         self.assertIn("Get-Content -LiteralPath $mergePath -Encoding UTF8", text)
 
