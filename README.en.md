@@ -49,7 +49,7 @@ Open the [latest release](https://github.com/YOURSJEYO/claude-switcher/releases/
 | Asset | Use |
 |---|---|
 | `ClaudeSwitcher-<version>-installer-kit.zip` | Full first-time install. Unzip and double-click `installer/安装.command`; it installs the core script, daemons, and desktop app. |
-| `ClaudeSwitcher-<version>-macos-arm64.dmg` / `.zip` | The macOS app bundle only, for machines where the core scripts are already installed. |
+| `ClaudeSwitcher-<version>-macos-arm64-app-only.dmg` / `.zip` | The macOS app bundle only (no core scripts); for machines where the core is already installed. First-time installs should use the installer kit. |
 | `ClaudeSwitcher-<version>-windows.zip` | Windows scripts (beta). See `windows/README.md`. |
 | `ClaudeSwitcher-<version>-linux.tar.gz` | Linux scripts (beta). See `linux/README.md`. |
 
