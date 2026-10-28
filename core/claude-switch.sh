@@ -811,7 +811,12 @@ check() {
     wr=$(webrtc_status "$ip")
     case "$wr" in fail:*) fails="$fails;WebRTC:${wr#fail:}" ;; esac
 
-    launchctl print system/local.claude-bodyguard >/dev/null 2>&1 || fails="$fails;保镖未运行"
+    guard_state=$(bodyguard_status)
+    case "$guard_state" in
+        ok:*) ;;
+        fail:*) fails="$fails;保镖:${guard_state#fail:}" ;;
+        *) fails="$fails;保镖:状态无法验证" ;;
+    esac
 
     # 置顶规则:Clash Verge 验证运行内核;全局模式下全部流量走代理,规则不适用;其他客户端只看行为检测
     if [ "$PROXY_MODE" = "clash-verge" ]; then
@@ -888,6 +893,33 @@ webrtc_status() {
     esac
 }
 
+# 保镖脚本由 root 安装，MODE 在安装时写死。核心切客户端后必须检测模式一致性，
+# 否则旧保镖可能按错误的代理进程状态关闭 Claude，单看 launchctl 在线会误报成功。
+bodyguard_status() {
+    if ! launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
+        echo 'fail:未安装'
+        return
+    fi
+    local guard="/Library/Application Support/claude-switcher/claude-bodyguard.sh"
+    if [ ! -r "$guard" ]; then
+        echo 'fail:守护脚本不可读或缺失(请重新运行安装器)'
+        return
+    fi
+    local guard_mode
+    guard_mode=$(sed -n 's/^MODE="\([^"]*\)".*/\1/p' "$guard" | head -1)
+    if [ -z "$guard_mode" ]; then
+        echo 'fail:守护模式无法识别(请重新运行安装器)'
+        return
+    fi
+    if [ "$guard_mode" != "$PROXY_MODE" ]; then
+        echo "fail:客户端不一致(核心=$PROXY_MODE,保镖=$guard_mode;请重新运行安装器同步)"
+        return
+    fi
+    local lastkill
+    lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null | cut -c1-40)
+    echo "ok:${lastkill:-待命}"
+}
+
 # 逐项输出检查结果(供UI使用): 名称=ok|fail:细节
 checkdetail() {
     if proxy_alive; then
@@ -934,12 +966,7 @@ checkdetail() {
         *) echo "DNS=fail:未走隧道(${dnsip:-空})" ;;
     esac
     echo "WebRTC=$(webrtc_status "$ip")"
-    if launchctl print system/local.claude-bodyguard >/dev/null 2>&1; then
-        lastkill=$(tail -1 "$HOME/Library/Logs/claude-bodyguard.log" 2>/dev/null | cut -c1-40)
-        echo "保镖=ok:${lastkill:-待命}"
-    else
-        echo '保镖=fail:未安装'
-    fi
+    echo "保镖=$(bodyguard_status)"
     # 置顶规则:Clash Verge 验证运行内核;全局模式下规则不适用(全部流量已走代理)
     if [ "$PROXY_MODE" = "clash-verge" ]; then
         if [ "$(clash_mode)" = "global" ]; then
@@ -1160,7 +1187,13 @@ set_client() {
     [ -f "$target" ] && [ -w "$target" ] || { echo "FAIL:找不到可写的核心脚本: $target"; return 1; }
     sed -i '' "s|^PROXY_MODE=\"[^\"]*\"|PROXY_MODE=\"$mode\"|" "$target" || { echo "FAIL:写入失败"; return 1; }
     grep -q "^PROXY_MODE=\"$mode\"" "$target" || { echo "FAIL:校验失败"; return 1; }
+    PROXY_MODE="$mode"
     echo "OK:代理客户端已设为 $mode"
+    guard_state=$(bodyguard_status)
+    case "$guard_state" in
+        fail:未安装) echo "INFO:保镖尚未安装,checkdetail 会提示未安装" ;;
+        fail:*) echo "WARN:保镖校验未通过(${guard_state#fail:});请重新运行安装器同步 root 守护脚本(需管理员权限),完成前不要启动 Claude" ;;
+    esac
     echo "INFO:重新运行 checkdetail 生效;非 Clash 客户端请在应用内自行添加 Claude 域名置顶规则"
     return 0
 }
