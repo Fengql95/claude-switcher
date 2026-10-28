@@ -18,7 +18,7 @@
 
 ## 安装
 
-1. 先开启代理（TUN 模式）。安装器会检查出口不能是 `CN`，并按当前出口国家写入 `$COUNTRY_TARGET`；需要美国出口时请先把节点切到美国。地区识别会依次尝试 ipinfo / ipapi / ifconfig / Cloudflare trace，全部失败时可手动选择国家；也可设 `$env:FORCE=1` 强制按 US 继续
+1. 先开启代理（TUN 模式）。安装器会检查出口不能是 `CN`，并按当前出口国家写入 `$COUNTRY_TARGET`、`$TZ_TARGET`、`$LOCALE_TARGET`，同时尝试设置系统时区与地区格式；需要美国出口时请先把节点切到美国。地区识别会依次尝试 ipinfo / ipapi / ifconfig / Cloudflare trace，全部失败时可手动选择国家（含 MY）；也可设 `$env:FORCE=1` 强制按 US 继续
 2. 右键 `install.ps1` →「使用 PowerShell 运行」,或在管理员 PowerShell 中执行
 3. 如果提示禁止运行脚本,先执行一次:
    ```powershell
@@ -32,7 +32,7 @@ Windows 版启动时会静默检查 GitHub 最新 Release，有新版本时在�
 
 - **自动检查**：启动后后台调用 `check-update`，不阻塞界面；24 小时缓存命中时直接显示提示条，不重复打扰
 - **一键更新**：点「一键更新」后自动下载 Windows zip 与 `SHA256SUMS-release.txt`，SHA256 校验通过才替换 `%USERPROFILE%\.claude-switcher` 下的 `claude-switch.ps1` / `claude-bodyguard.ps1` / `SwitcherUI.ps1`
-- **保留配置**：更新前读取旧脚本的 `$PROXY_MODE` / `$COUNTRY_TARGET` / `$TZ_TARGET` / `$PROXY_GROUP`，写入新脚本对应行
+- **保留配置**：更新前读取旧脚本的 `$PROXY_MODE` / `$COUNTRY_TARGET` / `$TZ_TARGET` / `$LOCALE_TARGET` / `$PROXY_GROUP`，写入新脚本对应行
 - **备份与回滚**：替换前备份到 `backup-<当前版本>-<时间戳>\`；任一步失败会自动回滚并提示原因，旧版本继续可用
 - **无需管理员**：更新只改当前用户目录，不弹 UAC；替换后重启 `ClaudeBodyguard` 计划任务并自动重启界面
 - **稍后与手动检查**：点「稍后」会隐藏提示条，24 小时内不再自动提示；底部「检查更新」会清除缓存并立即检查一次
@@ -55,7 +55,7 @@ TUN 判定顺序：先看是否存在 `198.18.x.x` 假 IP（Clash 系 fake-ip）
 
 ## Clash 规则与全局模式
 
-「一键修复」会先识别 Clash 当前模式（Mihomo API `/configs`，失败再读 `clash-verge.yaml` / `verge.yaml` 的 `mode:`），再决定是否动规则：
+「一键修复」会先识别 Clash 当前模式（Mihomo API `/configs`，失败再依次读 `clash-verge.yaml` / `config.yaml` / `verge.yaml` 的 `mode:`），再决定是否动规则：
 
 - **全局 / 直连模式**：规则本来就不生效，修复不写 `Merge.yaml`，也不写 `Script.js`；只有发现旧版遗留的 Merge 规则时才清理并重启一次 Clash。没有遗留时不改动任何配置。
 - **规则模式**：只写 `profiles\Script.js` 的托管块（`// >>> claude-switcher managed rules >>>`），不再写 `Merge.yaml`。写入前备份，重启后通过内核 `/rules` 验证前 16 条规则；验证失败会自动从备份回滚 `Script.js`。规则模式需要在 Clash Verge 中启用「全局扩展脚本」，否则验证会失败并回滚。
@@ -66,9 +66,21 @@ TUN 判定顺序：先看是否存在 `198.18.x.x` 假 IP（Clash 系 fake-ip）
 
 「一键修复」的规则模式/清理结果会显示在界面 Banner；检查列表的「规则置顶」也会同步显示 `ok` / `warn` / `fail`。
 
+## 地区自适应与 set-region
+
+- **安装时自动识别**：安装器按出口国家写入 `$COUNTRY_TARGET`、`$TZ_TARGET` 和 `$LOCALE_TARGET`，并尝试设置系统时区与地区格式；出口为 `CN` 时拒绝安装。国家→时区/地区格式映射覆盖 US / JP / TW / HK / SG / GB / DE / FR / KR / AU / CA / MY，其他回退 `America/New_York` / `en-US`。
+- **换节点后运行 `set-region`**：
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.claude-switcher\claude-switch.ps1" set-region
+  ```
+  它会依次尝试 ipinfo / ipapi / ifconfig / Cloudflare trace 重新探测出口，更新脚本头部的三个目标，弹一次 UAC 设置时区，并用用户级 `Set-Culture` 设置地区格式；取消 UAC 或设置失败会给出警告，但配置目标已写入。输出包含 `OK:region=<国家> tz=<IANA> locale=<locale> source=<来源>`。
+- **地区检查按 `$LOCALE_TARGET` 比较**：不再写死 `en-US`，而是比较 `[System.Globalization.CultureInfo]::CurrentCulture.Name` 与目标 locale，大小写不敏感；不一致时显示 `地区=fail:<当前>(期望<目标>)`。
+- **CN 拒绝**：出口国家为 `CN` 时 `set-region` 输出 `FAIL:出口国家为 CN,已中止`，不写入目标。
+- **不会每次检查自动跟随出口**：目标在安装或 `set-region` 时固定，避免节点切换时地区/时区来回变化；需要换区时显式运行 `set-region`。
+
 ## 与 macOS 版的差异（注意事项）
 
-> macOS 版支持 Clash Verge / Shadowrocket / sing-box / ClashX / Surge 与地区自适应（按出口国家自动锁定时区+地区格式，换节点后 `set-region` 一键重配）。Windows 版已对齐多客户端检测，但 **Shadowrocket 仅 macOS 可用**；Windows 的时区映射表目前覆盖美国主要时区、加拿大多伦多/温哥华、日本、韩国、新加坡、台湾、香港、英国、德国、法国、澳大利亚（悉尼/墨尔本），其他时区会回退到 `Eastern Standard Time`，可在脚本头部手动修改 `$TZ_TARGET`。`地区` 检查目前仍固定为 `en-US`，不随出口国家调整。换国家后 Windows 版暂无 `set-region`，需要重跑安装器（会重新写入 `$COUNTRY_TARGET` / `$TZ_TARGET`）或手动修改脚本头部。macOS 的 `update` 命令与 12 小时自动检查、48 小时 IP 审查未移植到 Windows；Windows 另有一套启动检查 + 一键更新，见上文「更新」。
+> macOS 版支持 Clash Verge / Shadowrocket / sing-box / ClashX / Surge 与地区自适应（按出口国家自动锁定时区+地区格式，换节点后 `set-region` 一键重配）。Windows 版已对齐多客户端检测与地区自适应，但 **Shadowrocket 仅 macOS 可用**；Windows 的时区映射覆盖美国主要时区、加拿大多伦多/温哥华、日本、韩国、新加坡、台湾、香港、英国、德国、法国、澳大利亚（悉尼/墨尔本）和马来西亚（吉隆坡），其他时区会回退到 `Eastern Standard Time`。地区格式由 `$LOCALE_TARGET` 控制，`set-region` 可重新探测出口并更新国家/时区/地区格式。macOS 的 `update` 命令与 12 小时自动检查、48 小时 IP 审查未移植到 Windows；Windows 另有一套启动检查 + 一键更新，见上文「更新」。
 
 | 项目 | 说明 |
 |---|---|

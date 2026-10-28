@@ -1,5 +1,5 @@
 ﻿# Claude 账号切换器 - Windows 核心脚本
-# 用法: powershell -NoProfile -File claude-switch.ps1 check|status|switch A|B|checkdetail|fix|check-update|update-now
+# 用法: powershell -NoProfile -File claude-switch.ps1 check|status|switch A|B|checkdetail|fix|set-region|check-update|update-now
 $ErrorActionPreference = 'Continue'
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
@@ -7,6 +7,7 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 $PROXY_MODE = "clash-verge"            # 代理客户端: clash-verge|sing-box|clashx|surge|wireguard|other|auto
 $COUNTRY_TARGET = "US"                 # 目标出口国家(安装时按出口自动识别)
 $TZ_TARGET = "Eastern Standard Time"   # Windows 时区ID
+$LOCALE_TARGET = "en-US"               # 地区格式目标(安装/set-region 自动写入)
 $PROXY_GROUP = "GLOBAL"                # Clash 代理组名
 # =======================================================
 
@@ -147,6 +148,213 @@ function Get-Egress {
     return @{ ip = $ip; loc = $loc }
 }
 
+# ============ 地区映射(安装器与 set-region 共用同一套目标) ============
+$COUNTRY_TZ = @{
+    'US' = 'America/New_York'; 'JP' = 'Asia/Tokyo'; 'TW' = 'Asia/Taipei'
+    'HK' = 'Asia/Hong_Kong'; 'SG' = 'Asia/Singapore'; 'GB' = 'Europe/London'
+    'DE' = 'Europe/Berlin'; 'FR' = 'Europe/Paris'; 'KR' = 'Asia/Seoul'
+    'AU' = 'Australia/Sydney'; 'CA' = 'America/Toronto'; 'MY' = 'Asia/Kuala_Lumpur'
+}
+$COUNTRY_LOCALE = @{
+    'US' = 'en-US'; 'JP' = 'ja-JP'; 'TW' = 'zh-TW'
+    'HK' = 'zh-HK'; 'SG' = 'en-SG'; 'GB' = 'en-GB'
+    'DE' = 'de-DE'; 'FR' = 'fr-FR'; 'KR' = 'ko-KR'
+    'AU' = 'en-AU'; 'CA' = 'en-CA'; 'MY' = 'ms-MY'
+}
+
+function Get-CountryDefaultTimeZone([string]$country) {
+    $c = ([string]$country).Trim().ToUpperInvariant()
+    if ($COUNTRY_TZ.ContainsKey($c)) { return $COUNTRY_TZ[$c] }
+    return 'America/New_York'
+}
+
+function Get-CountryLocale([string]$country) {
+    $c = ([string]$country).Trim().ToUpperInvariant()
+    if ($COUNTRY_LOCALE.ContainsKey($c)) { return $COUNTRY_LOCALE[$c] }
+    return 'en-US'
+}
+
+# IANA -> Windows 时区 ID;未知返回 $null,由调用方决定回退
+function ConvertTo-WindowsTimeZone([string]$iana) {
+    $map = @{
+        'America/New_York'    = 'Eastern Standard Time'
+        'America/Chicago'     = 'Central Standard Time'
+        'America/Denver'      = 'Mountain Standard Time'
+        'America/Los_Angeles' = 'Pacific Standard Time'
+        'America/Toronto'     = 'Eastern Standard Time'
+        'America/Vancouver'   = 'Pacific Standard Time'
+        'Asia/Singapore'      = 'Singapore Standard Time'
+        'Asia/Tokyo'          = 'Tokyo Standard Time'
+        'Asia/Seoul'          = 'Korea Standard Time'
+        'Asia/Taipei'         = 'Taipei Standard Time'
+        'Asia/Hong_Kong'      = 'China Standard Time'
+        'Europe/London'       = 'GMT Standard Time'
+        'Europe/Berlin'       = 'W. Europe Standard Time'
+        'Europe/Paris'        = 'Romance Standard Time'
+        'Australia/Sydney'    = 'AUS Eastern Standard Time'
+        'Australia/Melbourne' = 'AUS Eastern Standard Time'
+        'Asia/Kuala_Lumpur'   = 'Singapore Standard Time'
+    }
+    if ($map.ContainsKey($iana)) { return $map[$iana] }
+    return $null
+}
+
+# 多源出口探测(与安装器同源):ipinfo -> ipapi -> ifconfig -> Cloudflare trace
+function Get-GeoInfo {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $ua = 'claude-switcher/1.0'
+    $diag = New-Object System.Collections.Generic.List[string]
+    $first = $null
+    $firstTzDefault = $false
+    $sources = @(
+        @{ Name = 'ipinfo'; Url = 'https://ipinfo.io/json'; Country = 'country'; Timezone = 'timezone' },
+        @{ Name = 'ipapi'; Url = 'https://ipapi.co/json/'; Country = 'country_code'; Timezone = 'timezone' },
+        @{ Name = 'ifconfig'; Url = 'https://ifconfig.co/json'; Country = 'country_iso'; Timezone = 'timezone' }
+    )
+    foreach ($src in $sources) {
+        try {
+            $data = Invoke-RestMethod -Uri $src.Url -UserAgent $ua -TimeoutSec 8 -ErrorAction Stop
+        } catch {
+            $reason = '超时/连接失败'
+            try {
+                if ($_.Exception.Response) { $reason = 'HTTP ' + [int]$_.Exception.Response.StatusCode }
+            } catch {}
+            $diag.Add("$($src.Name) $reason")
+            continue
+        }
+        $ccField = $src.Country
+        $tzField = $src.Timezone
+        $cc = ([string]$data.$ccField).Trim().ToUpperInvariant()
+        $tz = [string]$data.$tzField
+        if ($cc -notmatch '^[A-Z]{2}$') { $diag.Add("$($src.Name) 国家字段无效"); continue }
+        $usedDefault = $false
+        if ($tz -notmatch '^[A-Za-z_]+/[A-Za-z_]+(/[A-Za-z_]+)?$') {
+            $tz = Get-CountryDefaultTimeZone $cc
+            $usedDefault = $true
+        }
+        if (-not $first) {
+            $first = [pscustomobject]@{ Country = $cc; Timezone = $tz; Source = $src.Name; Ip = [string]$data.ip }
+            $firstTzDefault = $usedDefault
+        } elseif ($cc -ne $first.Country) {
+            $diag.Add("出口国家不一致($($first.Source)=$($first.Country) $($src.Name)=$cc),采用优先级更高的 $($first.Source)")
+        }
+    }
+    try {
+        $trace = Invoke-WebRequest -Uri 'https://www.cloudflare.com/cdn-cgi/trace' -UserAgent $ua -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
+        $loc = $null; $tip = ''
+        foreach ($line in ($trace.Content -split "`r?`n")) {
+            if ($line -match '^loc=([A-Za-z]{2})$') { $loc = $Matches[1].ToUpperInvariant() }
+            if ($line -match '^ip=(\S+)$') { $tip = $Matches[1] }
+        }
+        if ($loc -and $loc -match '^[A-Z]{2}$') {
+            $tz = Get-CountryDefaultTimeZone $loc
+            if (-not $first) {
+                $first = [pscustomobject]@{ Country = $loc; Timezone = $tz; Source = 'cloudflare'; Ip = $tip }
+                $firstTzDefault = $true
+            } elseif ($loc -ne $first.Country) {
+                $diag.Add("出口国家不一致($($first.Source)=$($first.Country) cloudflare=$loc),采用优先级更高的 $($first.Source)")
+            }
+        } else {
+            $diag.Add('cloudflare loc 无效')
+        }
+    } catch {
+        $reason = '超时/连接失败'
+        try {
+            if ($_.Exception.Response) { $reason = 'HTTP ' + [int]$_.Exception.Response.StatusCode }
+        } catch {}
+        $diag.Add("cloudflare $reason")
+    }
+    $outCountry = ''; $outTz = ''; $outSource = ''; $outIp = '未知'
+    if ($first) {
+        $outCountry = $first.Country
+        $outTz = $first.Timezone
+        $outSource = $first.Source
+        if ($first.Ip) { $outIp = $first.Ip }
+    }
+    return [pscustomobject]@{
+        Country = $outCountry
+        Timezone = $outTz
+        Source = $outSource
+        Ip = $outIp
+        TimezoneDefault = $firstTzDefault
+        Diagnostics = ($diag -join '; ')
+    }
+}
+
+function Invoke-SetRegion {
+    $geo = Get-GeoInfo
+    if (-not $geo.Country) {
+        "FAIL:所有出口探测源均失败($($geo.Diagnostics))"
+        "HINT:请检查代理规则/稍后重试"
+        return
+    }
+    $country = ([string]$geo.Country).Trim().ToUpperInvariant()
+    if ($country -eq 'CN') {
+        "FAIL:出口国家为 CN,已中止"
+        return
+    }
+
+    $ianaTz = [string]$geo.Timezone
+    $tzFromDefault = [bool]$geo.TimezoneDefault
+    if ([string]::IsNullOrWhiteSpace($ianaTz) -or $ianaTz -notmatch '^[A-Za-z_]+/[A-Za-z_]+(/[A-Za-z_]+)?$') {
+        $ianaTz = Get-CountryDefaultTimeZone $country
+        $tzFromDefault = $true
+    }
+    $tzId = ConvertTo-WindowsTimeZone $ianaTz
+    if ([string]::IsNullOrWhiteSpace($tzId)) {
+        $tzId = 'Eastern Standard Time'
+        "WARN:时区 $ianaTz 无 Windows 映射,回退 Eastern Standard Time"
+    }
+    $locale = Get-CountryLocale $country
+
+    $selfPath = $PSCommandPath
+    if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
+    if (-not $selfPath -or -not (Test-Path -LiteralPath $selfPath)) {
+        "FAIL:无法定位当前脚本,配置未写入"
+        return
+    }
+    try {
+        $text = [System.IO.File]::ReadAllText($selfPath)
+        $text = Set-ScriptConfigValue $text 'COUNTRY_TARGET' $country
+        $text = Set-ScriptConfigValue $text 'TZ_TARGET' $tzId
+        $text = Set-ScriptConfigValue $text 'LOCALE_TARGET' $locale
+        [System.IO.File]::WriteAllText($selfPath, $text, (New-Object System.Text.UTF8Encoding($true)))
+    } catch {
+        "FAIL:写入配置失败:$($_.Exception.Message)"
+        return
+    }
+    $script:COUNTRY_TARGET = $country
+    $script:TZ_TARGET = $tzId
+    $script:LOCALE_TARGET = $locale
+
+    $tmp = "$env:TEMP\claude-set-region-$([guid]::NewGuid().Guid).ps1"
+    try {
+        $tzEsc = $tzId.Replace("'", "''")
+        $tmpScript = "`$ErrorActionPreference = 'Stop'`r`nSet-TimeZone -Id '$tzEsc'`r`nif ((Get-TimeZone).Id -ne '$tzEsc') { exit 1 }`r`n"
+        $tmpScript | Out-File -Encoding utf8 $tmp
+        $proc = Start-Process powershell -Verb RunAs -Wait -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$tmp`""
+        if ($proc -and $proc.ExitCode -eq 0) {
+            "OK:时区已设置为 $tzId"
+        } else {
+            "WARN:时区未修改,请手动设置"
+        }
+    } catch {
+        "WARN:时区未修改,请手动设置"
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+
+    try {
+        Set-Culture -CultureInfo $locale -ErrorAction Stop
+        "OK:地区格式已设置为 $locale"
+    } catch {
+        "WARN:地区格式未修改,请手动在「区域格式」中修改"
+    }
+
+    "OK:region=$country tz=$ianaTz locale=$locale source=$($geo.Source)"
+    if ($tzFromDefault) { "INFO:时区使用国家默认(可手动改)" }
+}
+
 # STUN 探针(纯 .NET UDP,手工构造 RFC5389 报文)
 function Get-StunPublicIP([string]$server, [int]$port, [int]$timeoutMs = 2000) {
     try { $addr = ([System.Net.Dns]::GetHostAddresses($server) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | Select-Object -First 1) } catch { return $null }
@@ -215,7 +423,7 @@ $CLAUDE_DOMAINS = @(
 )
 $CLAUDE_PORTS = @('3478', '5349', '19302')
 
-# 读取 YAML 中第一个 key: value 标量(只用于 clash-verge.yaml / verge.yaml 的顶层字段)
+# 读取 YAML 中第一个 key: value 标量(用于 clash-verge.yaml / config.yaml / verge.yaml 的顶层字段)
 function Get-YamlScalar([string]$path, [string]$key) {
     if (-not (Test-Path -LiteralPath $path)) { return $null }
     try {
@@ -263,7 +471,7 @@ function Get-ClashMode {
                 if ($m -eq 'global' -or $m -eq 'rule' -or $m -eq 'direct') { return $m }
             } catch {}
         }
-        foreach ($name in @('clash-verge.yaml', 'verge.yaml')) {
+        foreach ($name in @('clash-verge.yaml', 'config.yaml', 'verge.yaml')) {
             $p = Join-Path $CLASH_DIR $name
             if (-not (Test-Path -LiteralPath $p)) { continue }
             foreach ($line in Get-Content -LiteralPath $p -Encoding UTF8 -ErrorAction SilentlyContinue) {
@@ -588,8 +796,8 @@ function Invoke-CheckDetail {
     $tz = (Get-TimeZone).Id
     if ($tz -eq $TZ_TARGET) { "时区=ok" } else { "时区=fail:$tz" }
 
-    $cult = (Get-Culture).Name
-    if ($cult -eq 'en-US') { "地区=ok" } else { "地区=fail:$cult" }
+    $cult = [System.Globalization.CultureInfo]::CurrentCulture.Name
+    if ($cult -eq $LOCALE_TARGET) { "地区=ok:$cult" } else { "地区=fail:$cult(期望$LOCALE_TARGET)" }
 
     $v6off = [bool](Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq $true })
     if (-not $v6off) { "IPv6=ok:已关闭" } else { "IPv6=fail:未关闭" }
@@ -909,10 +1117,10 @@ function Invoke-UpdateNow {
             if (-not (Test-Path -LiteralPath (Join-Path $pkgDir $fn))) { throw "更新包缺少 $fn" }
         }
 
-        # 保留当前安装的 4 项用户配置
+        # 保留当前安装的 5 项用户配置
         $currentText = [System.IO.File]::ReadAllText((Join-Path $BASE 'claude-switch.ps1'))
         $newText = [System.IO.File]::ReadAllText($newCore.FullName)
-        foreach ($name in @('PROXY_MODE', 'COUNTRY_TARGET', 'TZ_TARGET', 'PROXY_GROUP')) {
+        foreach ($name in @('PROXY_MODE', 'COUNTRY_TARGET', 'TZ_TARGET', 'LOCALE_TARGET', 'PROXY_GROUP')) {
             $value = Get-ScriptConfigValue $currentText $name
             if ($null -ne $value) { $newText = Set-ScriptConfigValue $newText $name ([string]$value) }
         }
@@ -988,7 +1196,8 @@ switch ($args[0]) {
         $r
     }
     'switch'       { Invoke-Switch $args[1] }
+    'set-region'   { Invoke-SetRegion }
     'check-update' { Invoke-CheckUpdate }
     'update-now'   { Invoke-UpdateNow }
-    default        { "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|check-update|update-now" }
+    default        { "用法: claude-switch.ps1 checkdetail|status|fix|switch A|B|set-region|check-update|update-now" }
 }

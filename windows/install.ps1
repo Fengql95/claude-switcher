@@ -56,12 +56,18 @@ $countryTz = @{
     'US' = 'America/New_York'; 'JP' = 'Asia/Tokyo'; 'TW' = 'Asia/Taipei'
     'HK' = 'Asia/Hong_Kong'; 'SG' = 'Asia/Singapore'; 'GB' = 'Europe/London'
     'DE' = 'Europe/Berlin'; 'FR' = 'Europe/Paris'; 'KR' = 'Asia/Seoul'
-    'AU' = 'Australia/Sydney'; 'CA' = 'America/Toronto'
+    'AU' = 'Australia/Sydney'; 'CA' = 'America/Toronto'; 'MY' = 'Asia/Kuala_Lumpur'
+}
+$countryLocale = @{
+    'US' = 'en-US'; 'JP' = 'ja-JP'; 'TW' = 'zh-TW'
+    'HK' = 'zh-HK'; 'SG' = 'en-SG'; 'GB' = 'en-GB'
+    'DE' = 'de-DE'; 'FR' = 'fr-FR'; 'KR' = 'ko-KR'
+    'AU' = 'en-AU'; 'CA' = 'en-CA'; 'MY' = 'ms-MY'
 }
 
 function Get-GeoInfo {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $headers = @{ 'User-Agent' = 'claude-switcher-installer/1.0' }
+    $ua = 'claude-switcher-installer/1.0'
     $diag = New-Object System.Collections.Generic.List[string]
     $first = $null
     $sources = @(
@@ -71,7 +77,7 @@ function Get-GeoInfo {
     )
     foreach ($src in $sources) {
         try {
-            $data = Invoke-RestMethod -Uri $src.Url -Headers $headers -TimeoutSec 8 -ErrorAction Stop
+            $data = Invoke-RestMethod -Uri $src.Url -UserAgent $ua -TimeoutSec 8 -ErrorAction Stop
         } catch {
             $reason = '超时/连接失败'
             try {
@@ -95,7 +101,7 @@ function Get-GeoInfo {
     }
     # Cloudflare trace 兜底(无时区,按国家默认)
     try {
-        $trace = Invoke-WebRequest -Uri 'https://www.cloudflare.com/cdn-cgi/trace' -Headers $headers -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
+        $trace = Invoke-WebRequest -Uri 'https://www.cloudflare.com/cdn-cgi/trace' -UserAgent $ua -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
         $loc = $null; $tip = ''
         foreach ($line in ($trace.Content -split "`r?`n")) {
             if ($line -match '^loc=([A-Za-z]{2})$') { $loc = $Matches[1].ToUpper() }
@@ -151,8 +157,8 @@ if (-not $country) {
         Write-Host ""
         Write-Host "请手动选择当前出口所在地区:" -ForegroundColor Yellow
         Write-Host "  1) US   2) JP   3) TW   4) HK   5) SG   6) GB"
-        Write-Host "  7) DE   8) FR   9) KR  10) AU  11) CA"
-        $choices = @('US', 'JP', 'TW', 'HK', 'SG', 'GB', 'DE', 'FR', 'KR', 'AU', 'CA')
+        Write-Host "  7) DE   8) FR   9) KR  10) AU  11) CA  12) MY"
+        $choices = @('US', 'JP', 'TW', 'HK', 'SG', 'GB', 'DE', 'FR', 'KR', 'AU', 'CA', 'MY')
         while ($true) {
             $pick = Read-Host "请输入序号"
             if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $choices.Count) {
@@ -176,7 +182,9 @@ if ($country -eq 'CN') {
 }
 if (-not $ianaTz) { $ianaTz = 'America/New_York' }
 $COUNTRY_TARGET = $country
-Write-Host "[OK] 地区识别: 国家=$COUNTRY_TARGET 时区=$ianaTz 来源=$geoSource" -ForegroundColor Green
+$LOCALE_TARGET = $countryLocale[$country]
+if (-not $LOCALE_TARGET) { $LOCALE_TARGET = 'en-US' }
+Write-Host "[OK] 地区识别: 国家=$COUNTRY_TARGET 时区=$ianaTz 格式=$LOCALE_TARGET 来源=$geoSource" -ForegroundColor Green
 Write-Host "[OK] 出口: $ip ($COUNTRY_TARGET)" -ForegroundColor Green
 
 # ---- 2. 自动识别代理组名(仅 Clash Verge) ----
@@ -199,25 +207,30 @@ if ($PROXY_MODE -eq 'clash-verge' -and $CLASH_DIR) {
 }
 
 # ---- 3. IANA 时区 -> Windows 时区ID ----
-$tzMap = @{
-    'America/New_York'    = 'Eastern Standard Time'
-    'America/Chicago'     = 'Central Standard Time'
-    'America/Denver'      = 'Mountain Standard Time'
-    'America/Los_Angeles' = 'Pacific Standard Time'
-    'America/Toronto'     = 'Eastern Standard Time'
-    'America/Vancouver'   = 'Pacific Standard Time'
-    'Asia/Singapore'      = 'Singapore Standard Time'
-    'Asia/Tokyo'          = 'Tokyo Standard Time'
-    'Asia/Seoul'          = 'Korea Standard Time'
-    'Asia/Taipei'         = 'Taipei Standard Time'
-    'Asia/Hong_Kong'      = 'China Standard Time'
-    'Europe/London'       = 'GMT Standard Time'
-    'Europe/Berlin'       = 'W. Europe Standard Time'
-    'Europe/Paris'        = 'Romance Standard Time'
-    'Australia/Sydney'    = 'AUS Eastern Standard Time'
-    'Australia/Melbourne' = 'AUS Eastern Standard Time'
+function ConvertTo-WindowsTimeZone([string]$iana) {
+    $map = @{
+        'America/New_York'    = 'Eastern Standard Time'
+        'America/Chicago'     = 'Central Standard Time'
+        'America/Denver'      = 'Mountain Standard Time'
+        'America/Los_Angeles' = 'Pacific Standard Time'
+        'America/Toronto'     = 'Eastern Standard Time'
+        'America/Vancouver'   = 'Pacific Standard Time'
+        'Asia/Singapore'      = 'Singapore Standard Time'
+        'Asia/Tokyo'          = 'Tokyo Standard Time'
+        'Asia/Seoul'          = 'Korea Standard Time'
+        'Asia/Taipei'         = 'Taipei Standard Time'
+        'Asia/Hong_Kong'      = 'China Standard Time'
+        'Europe/London'       = 'GMT Standard Time'
+        'Europe/Berlin'       = 'W. Europe Standard Time'
+        'Europe/Paris'        = 'Romance Standard Time'
+        'Australia/Sydney'    = 'AUS Eastern Standard Time'
+        'Australia/Melbourne' = 'AUS Eastern Standard Time'
+        'Asia/Kuala_Lumpur'   = 'Singapore Standard Time'
+    }
+    if ($map.ContainsKey($iana)) { return $map[$iana] }
+    return $null
 }
-$tzId = $tzMap[$ianaTz]
+$tzId = ConvertTo-WindowsTimeZone $ianaTz
 if (-not $tzId) {
     Write-Host "[WARN] 时区 $ianaTz 无 Windows 映射,回退 Eastern Standard Time" -ForegroundColor Yellow
     $tzId = 'Eastern Standard Time'
@@ -231,15 +244,17 @@ Copy-Item "$PSScriptRoot\claude-switch.ps1"   "$BASE\claude-switch.ps1" -Force
 Copy-Item "$PSScriptRoot\SwitcherUI.ps1"      "$BASE\SwitcherUI.ps1" -Force
 Copy-Item "$PSScriptRoot\claude-bodyguard.ps1" "$BASE\claude-bodyguard.ps1" -Force
 
-# 写入探测到的客户端模式/代理组名/国家/时区(替换串里的 $ 用 $$ 转义,避免被当作捕获组)
+# 写入探测到的客户端模式/代理组名/国家/时区/地区格式(替换串里的 $ 用 $$ 转义,避免被当作捕获组)
 $core = Get-Content "$BASE\claude-switch.ps1" -Raw
 $modeEsc = $PROXY_MODE.Replace('$', '$$')
 $countryEsc = $COUNTRY_TARGET.Replace('$', '$$')
 $tzEsc = $TZ_TARGET.Replace('$', '$$')
+$localeEsc = $LOCALE_TARGET.Replace('$', '$$')
 $grpEsc = $grp.Replace('$', '$$')
 $core = $core -replace '\$PROXY_MODE = "[^"]*"', ('$$PROXY_MODE = "' + $modeEsc + '"')
 $core = $core -replace '\$COUNTRY_TARGET = "[^"]*"', ('$$COUNTRY_TARGET = "' + $countryEsc + '"')
 $core = $core -replace '\$TZ_TARGET = "[^"]*"', ('$$TZ_TARGET = "' + $tzEsc + '"')
+$core = $core -replace '\$LOCALE_TARGET = "[^"]*"', ('$$LOCALE_TARGET = "' + $localeEsc + '"')
 $core = $core -replace '\$PROXY_GROUP = "[^"]*"', ('$$PROXY_GROUP = "' + $grpEsc + '"')
 # 强制写回 UTF-8 BOM:计划任务用 powershell.exe 5.1 读取,无 BOM 会把中文读成乱码
 $utf8Bom = New-Object System.Text.UTF8Encoding -ArgumentList $true
@@ -277,6 +292,12 @@ if ($PROXY_MODE -eq 'clash-verge') {
 
 # ---- 7. 系统级配置 ----
 Set-TimeZone -Id $TZ_TARGET
+try {
+    Set-Culture -CultureInfo $LOCALE_TARGET -ErrorAction Stop
+    Write-Host "[OK] 地区格式已设置为 $LOCALE_TARGET" -ForegroundColor Green
+} catch {
+    Write-Host "[WARN] 地区格式未设置,请安装后运行 set-region 或手动在「区域格式」中选择 $LOCALE_TARGET" -ForegroundColor Yellow
+}
 Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled } | Disable-NetAdapterBinding -Confirm:$false
 Clear-DnsClientCache
 Write-Host "[OK] 时区已锁定 / IPv6 已关闭 / DNS 缓存已刷新" -ForegroundColor Green

@@ -25,6 +25,11 @@ ALLOWED_UPDATE_HOSTS = {
     "objects.githubusercontent.com",
     "github-releases.githubusercontent.com",
     "codeload.github.com",
+    # 地区探测（set-region / Get-GeoInfo）的公开来源
+    "www.cloudflare.com",
+    "ipinfo.io",
+    "ipapi.co",
+    "ifconfig.co",
 }
 
 
@@ -135,7 +140,7 @@ class WindowsUpdateStaticTests(unittest.TestCase):
 
         self.assertIn("'check-update'", text)
         self.assertIn("'update-now'", text)
-        self.assertIn("checkdetail|status|fix|switch A|B|check-update|update-now", text)
+        self.assertIn("checkdetail|status|fix|switch A|B|set-region|check-update|update-now", text)
         # check-update 不得创建目录/写文件
         self.assertIn("$args[0] -ne 'check-update'", text)
 
@@ -176,8 +181,14 @@ class WindowsUpdateStaticTests(unittest.TestCase):
         self.assertIn("校验失败", body)
         self.assertIn("Expand-Archive", body)
         self.assertIn("Test-GitHubDownloadUrl", body)
-        # 4 项用户配置注入
-        for key in ("PROXY_MODE", "COUNTRY_TARGET", "TZ_TARGET", "PROXY_GROUP"):
+        # 5 项用户配置注入
+        for key in (
+            "PROXY_MODE",
+            "COUNTRY_TARGET",
+            "TZ_TARGET",
+            "LOCALE_TARGET",
+            "PROXY_GROUP",
+        ):
             with self.subTest(key=key):
                 self.assertIn(key, body)
         self.assertIn("Set-ScriptConfigValue", body)
@@ -258,7 +269,7 @@ class WindowsUpdateStaticTests(unittest.TestCase):
             for url in re.findall(r"https?://([^/\s'\"]+)", line):
                 with self.subTest(line=line.strip()):
                     self.assertIn(url.lower(), ALLOWED_UPDATE_HOSTS)
-        for line in core.splitlines():
+        for line in update_now_body().splitlines():
             if "Invoke-WebRequest" in line:
                 self.assertNotRegex(
                     line,
