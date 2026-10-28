@@ -51,25 +51,133 @@ if (-not $PROXY_MODE) {
 Write-Host "[OK] 代理客户端: $PROXY_MODE" -ForegroundColor Green
 Write-Host "[OK] 前置检查通过" -ForegroundColor Green
 
-# ---- 1. 出口国家检查(不能是 CN,否则时区会锁错) ----
-$info = try { (& curl.exe -s --max-time 8 "https://ipinfo.io/json" 2>$null | ConvertFrom-Json) } catch { $null }
-$country = if ($info) { $info.country } else { '' }
-$ip = if ($info) { $info.ip } else { '未知' }
+# ---- 1. 出口国家探测(多源兜底;不能是 CN,否则时区会锁错) ----
+$countryTz = @{
+    'US' = 'America/New_York'; 'JP' = 'Asia/Tokyo'; 'TW' = 'Asia/Taipei'
+    'HK' = 'Asia/Hong_Kong'; 'SG' = 'Asia/Singapore'; 'GB' = 'Europe/London'
+    'DE' = 'Europe/Berlin'; 'FR' = 'Europe/Paris'; 'KR' = 'Asia/Seoul'
+    'AU' = 'Australia/Sydney'; 'CA' = 'America/Toronto'
+}
+
+function Get-GeoInfo {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $headers = @{ 'User-Agent' = 'claude-switcher-installer/1.0' }
+    $diag = New-Object System.Collections.Generic.List[string]
+    $first = $null
+    $sources = @(
+        @{ Name = 'ipinfo'; Url = 'https://ipinfo.io/json'; Country = 'country'; Timezone = 'timezone' },
+        @{ Name = 'ipapi'; Url = 'https://ipapi.co/json/'; Country = 'country_code'; Timezone = 'timezone' },
+        @{ Name = 'ifconfig'; Url = 'https://ifconfig.co/json'; Country = 'country_iso'; Timezone = 'timezone' }
+    )
+    foreach ($src in $sources) {
+        try {
+            $data = Invoke-RestMethod -Uri $src.Url -Headers $headers -TimeoutSec 8 -ErrorAction Stop
+        } catch {
+            $reason = '超时/连接失败'
+            try {
+                if ($_.Exception.Response) { $reason = 'HTTP ' + [int]$_.Exception.Response.StatusCode }
+            } catch {}
+            $diag.Add("$($src.Name) $reason")
+            continue
+        }
+        $ccField = $src.Country
+        $tzField = $src.Timezone
+        $cc = [string]$data.$ccField
+        $tz = [string]$data.$tzField
+        if ($cc -notmatch '^[A-Z]{2}$') { $diag.Add("$($src.Name) 国家字段无效"); continue }
+        if ($tz -notmatch '^[A-Za-z_]+/[A-Za-z_]+(/[A-Za-z_]+)?$') { $tz = $countryTz[$cc] }
+        if (-not $tz) { $tz = 'America/New_York' }
+        if (-not $first) {
+            $first = [pscustomobject]@{ Country = $cc; Timezone = $tz; Source = $src.Name; Ip = [string]$data.ip }
+        } elseif ($cc -ne $first.Country) {
+            Write-Host "[WARN] 出口国家不一致($($first.Source)=$($first.Country) $($src.Name)=$cc),采用优先级更高的 $($first.Source)" -ForegroundColor Yellow
+        }
+    }
+    # Cloudflare trace 兜底(无时区,按国家默认)
+    try {
+        $trace = Invoke-WebRequest -Uri 'https://www.cloudflare.com/cdn-cgi/trace' -Headers $headers -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
+        $loc = $null; $tip = ''
+        foreach ($line in ($trace.Content -split "`r?`n")) {
+            if ($line -match '^loc=([A-Za-z]{2})$') { $loc = $Matches[1].ToUpper() }
+            if ($line -match '^ip=(\S+)$') { $tip = $Matches[1] }
+        }
+        if ($loc -and $loc -match '^[A-Z]{2}$') {
+            $tz = $countryTz[$loc]
+            if (-not $tz) { $tz = 'America/New_York' }
+            if (-not $first) {
+                $first = [pscustomobject]@{ Country = $loc; Timezone = $tz; Source = 'cloudflare'; Ip = $tip }
+            } elseif ($loc -ne $first.Country) {
+                Write-Host "[WARN] 出口国家不一致($($first.Source)=$($first.Country) cloudflare=$loc),采用优先级更高的 $($first.Source)" -ForegroundColor Yellow
+            }
+        } else {
+            $diag.Add('cloudflare loc 无效')
+        }
+    } catch {
+        $reason = '超时/连接失败'
+        try {
+            if ($_.Exception.Response) { $reason = 'HTTP ' + [int]$_.Exception.Response.StatusCode }
+        } catch {}
+        $diag.Add("cloudflare $reason")
+    }
+    $outCountry = ''; $outTz = ''; $outSource = ''; $outIp = '未知'
+    if ($first) {
+        $outCountry = $first.Country
+        $outTz = $first.Timezone
+        $outSource = $first.Source
+        if ($first.Ip) { $outIp = $first.Ip }
+    }
+    return [pscustomobject]@{
+        Country = $outCountry
+        Timezone = $outTz
+        Source = $outSource
+        Ip = $outIp
+        Diagnostics = ($diag -join '; ')
+    }
+}
+
+$geo = Get-GeoInfo
+$country = $geo.Country
+$ianaTz = $geo.Timezone
+$geoSource = $geo.Source
+$ip = $geo.Ip
 $FORCE = $env:FORCE
+if (-not $country) {
+    Write-Host "[WARN] 未能识别出口国家,各源探测结果:" -ForegroundColor Yellow
+    Write-Host "   $($geo.Diagnostics)" -ForegroundColor DarkGray
+    if ($FORCE) {
+        $country = 'US'; $ianaTz = 'America/New_York'; $geoSource = 'force'
+        Write-Host "   FORCE=1,按 US / America/New_York 继续" -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        Write-Host "请手动选择当前出口所在地区:" -ForegroundColor Yellow
+        Write-Host "  1) US   2) JP   3) TW   4) HK   5) SG   6) GB"
+        Write-Host "  7) DE   8) FR   9) KR  10) AU  11) CA"
+        $choices = @('US', 'JP', 'TW', 'HK', 'SG', 'GB', 'DE', 'FR', 'KR', 'AU', 'CA')
+        while ($true) {
+            $pick = Read-Host "请输入序号"
+            if ($pick -match '^\d+$' -and [int]$pick -ge 1 -and [int]$pick -le $choices.Count) {
+                $country = $choices[[int]$pick - 1]; break
+            }
+            if ($pick -match '^[A-Za-z]{2}$' -and ($choices -contains $pick.ToUpper())) {
+                $country = $pick.ToUpper(); break
+            }
+            Write-Host "未识别的选择,请重试" -ForegroundColor Yellow
+        }
+        $ianaTz = $countryTz[$country]
+        $geoSource = 'manual'
+    }
+}
 if ($country -eq 'CN' -and -not $FORCE) {
     Write-Host "X 当前出口在国内(CN),请先开启代理(TUN模式)并确认节点可用再运行" -ForegroundColor Red
     pause; exit 1
 }
-if (-not $country) {
-    if ($FORCE) {
-        $country = 'US'
-        Write-Host "[WARN] 未能识别出口国家,FORCE 已跳过检查,按 US 写入" -ForegroundColor Yellow
-    } else {
-        Write-Host "X 未能识别出口国家,请确认代理已开启后重试(或用 FORCE=1 跳过)" -ForegroundColor Red
-        pause; exit 1
-    }
+if ($country -eq 'CN') {
+    $country = 'US'; $ianaTz = 'America/New_York'; $geoSource = 'force'
 }
-Write-Host "[OK] 出口: $ip ($country)" -ForegroundColor Green
+if (-not $ianaTz) { $ianaTz = 'America/New_York' }
+$COUNTRY_TARGET = $country
+Write-Host "[OK] 地区识别: 国家=$COUNTRY_TARGET 时区=$ianaTz 来源=$geoSource" -ForegroundColor Green
+Write-Host "[OK] 出口: $ip ($COUNTRY_TARGET)" -ForegroundColor Green
 
 # ---- 2. 自动识别代理组名(仅 Clash Verge) ----
 $grp = 'GLOBAL'
@@ -109,10 +217,13 @@ $tzMap = @{
     'Australia/Sydney'    = 'AUS Eastern Standard Time'
     'Australia/Melbourne' = 'AUS Eastern Standard Time'
 }
-$tzIana = if ($info -and $info.timezone) { $info.timezone } else { '' }
-$tzId = $tzMap[$tzIana]
-if (-not $tzId) { $tzId = 'Eastern Standard Time' }
-Write-Host "[OK] 锁定时区: $tzId (按出口IP识别)" -ForegroundColor Green
+$tzId = $tzMap[$ianaTz]
+if (-not $tzId) {
+    Write-Host "[WARN] 时区 $ianaTz 无 Windows 映射,回退 Eastern Standard Time" -ForegroundColor Yellow
+    $tzId = 'Eastern Standard Time'
+}
+$TZ_TARGET = $tzId
+Write-Host "[OK] 锁定时区: $TZ_TARGET (按出口IP识别)" -ForegroundColor Green
 
 # ---- 4. 安装文件 ----
 New-Item -ItemType Directory -Force -Path $BASE | Out-Null
@@ -123,8 +234,8 @@ Copy-Item "$PSScriptRoot\claude-bodyguard.ps1" "$BASE\claude-bodyguard.ps1" -For
 # 写入探测到的客户端模式/代理组名/国家/时区(替换串里的 $ 用 $$ 转义,避免被当作捕获组)
 $core = Get-Content "$BASE\claude-switch.ps1" -Raw
 $modeEsc = $PROXY_MODE.Replace('$', '$$')
-$countryEsc = $country.Replace('$', '$$')
-$tzEsc = $tzId.Replace('$', '$$')
+$countryEsc = $COUNTRY_TARGET.Replace('$', '$$')
+$tzEsc = $TZ_TARGET.Replace('$', '$$')
 $grpEsc = $grp.Replace('$', '$$')
 $core = $core -replace '\$PROXY_MODE = "[^"]*"', ('$$PROXY_MODE = "' + $modeEsc + '"')
 $core = $core -replace '\$COUNTRY_TARGET = "[^"]*"', ('$$COUNTRY_TARGET = "' + $countryEsc + '"')
@@ -165,7 +276,7 @@ if ($PROXY_MODE -eq 'clash-verge') {
 }
 
 # ---- 7. 系统级配置 ----
-Set-TimeZone -Id $tzId
+Set-TimeZone -Id $TZ_TARGET
 Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | Where-Object { $_.Enabled } | Disable-NetAdapterBinding -Confirm:$false
 Clear-DnsClientCache
 Write-Host "[OK] 时区已锁定 / IPv6 已关闭 / DNS 缓存已刷新" -ForegroundColor Green

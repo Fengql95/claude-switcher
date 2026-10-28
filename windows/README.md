@@ -18,7 +18,7 @@
 
 ## 安装
 
-1. 先开启代理（TUN 模式）。安装器会检查出口不能是 `CN`，并按当前出口国家写入 `$COUNTRY_TARGET`；需要美国出口时请先把节点切到美国。出口识别失败时可设 `$env:FORCE=1` 跳过检查
+1. 先开启代理（TUN 模式）。安装器会检查出口不能是 `CN`，并按当前出口国家写入 `$COUNTRY_TARGET`；需要美国出口时请先把节点切到美国。地区识别会依次尝试 ipinfo / ipapi / ifconfig / Cloudflare trace，全部失败时可手动选择国家；也可设 `$env:FORCE=1` 强制按 US 继续
 2. 右键 `install.ps1` →「使用 PowerShell 运行」,或在管理员 PowerShell 中执行
 3. 如果提示禁止运行脚本,先执行一次:
    ```powershell

@@ -124,12 +124,12 @@ git clone https://github.com/YOURSJEYO/claude-switcher.git
 
 ## 地区自适应
 
-不再锁死美国：安装程序按当前出口 IP 的国家自动锁定**目标国家 + 时区 + 地区格式**三件套（出口是 CN 会直接拒装，逼你先挂好代理）。之后换了其他国家的节点，不用重装，一条命令重新适配：
+不再锁死美国：安装程序按当前出口 IP 的国家自动锁定**目标国家 + 时区 + 地区格式**三件套（出口是 CN 会直接拒装，逼你先挂好代理）。地区识别按 ipinfo → ipapi → ifconfig → Cloudflare trace 多源依次探测，单个域名被规则判直连、被墙或限流时会自动换下一个源；全部失败时交互式安装器会列出诊断并让你手动选地区（`FORCE=1` 则强制 US / America/New_York）。之后换了其他国家的节点，不用重装，一条命令重新适配：
 
 ```bash
 ~/.local/bin/claude-switch.sh set-region
 # 自动探测出口国家 → 改写自身配置 → 设地区格式 → 弹一次授权锁时区 → 同步看门狗
-# 输出: OK:region=JP tz=Asia/Tokyo locale=ja_JP
+# 输出: OK:region=JP tz=Asia/Tokyo locale=ja_JP source=ipinfo
 ```
 
 14 项检查里的「出口 IP / 时区 / 地区」全部按新目标判定，界面无需任何改动。

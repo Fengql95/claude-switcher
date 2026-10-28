@@ -626,6 +626,128 @@ route_ok() {
     [ -z "$ROUTE_MISSED" ]
 }
 
+# 国家代码 → 默认 IANA 时区(cloudflare trace 等来源不带时区时使用)
+default_tz_for() {
+    case "$1" in
+        US) echo America/New_York ;; JP) echo Asia/Tokyo ;; TW) echo Asia/Taipei ;;
+        HK) echo Asia/Hong_Kong ;; SG) echo Asia/Singapore ;; GB) echo Europe/London ;;
+        DE) echo Europe/Berlin ;; FR) echo Europe/Paris ;; KR) echo Asia/Seoul ;;
+        AU) echo Australia/Sydney ;; CA) echo America/Toronto ;;
+        *) echo America/New_York ;;
+    esac
+}
+
+# 出口探测辅助:严格校验两位大写国家码与 IANA 时区格式
+_geo_valid_country() {
+    case "$1" in [A-Z][A-Z]) return 0 ;; *) return 1 ;; esac
+}
+_geo_valid_tz() {
+    [[ "$1" =~ ^[A-Za-z_]+/[A-Za-z_]+(/[A-Za-z_]+)?$ ]]
+}
+_geo_json_field() {
+    printf '%s\n' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+_geo_diag_add() {
+    GEO_DIAG="${GEO_DIAG:+$GEO_DIAG; }$1"
+    if [ -n "${GEO_DIAG_FILE:-}" ]; then
+        printf '%s\n' "$1" >>"$GEO_DIAG_FILE"
+    fi
+}
+# 取一个源;失败把简短原因(HTTP 码/超时)记进诊断,不打印
+_geo_fetch() {
+    local out rc code
+    _GEO_BODY=""
+    out=$(curl -s --max-time 8 -w '\n%{http_code}' "$1" 2>/dev/null); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        _geo_diag_add "$2 超时/连接失败"
+        return 1
+    fi
+    if [ -z "$out" ]; then
+        _geo_diag_add "$2 无响应"
+        return 1
+    fi
+    code=$(printf '%s\n' "$out" | tail -n 1)
+    case "$code" in
+        200)
+            _GEO_BODY=$(printf '%s\n' "$out" | sed '$d')
+            return 0 ;;
+        [0-9][0-9][0-9])
+            _geo_diag_add "$2 HTTP $code"
+            return 1 ;;
+        *)
+            # 没有 -w 状态行时按成功处理(兼容 curl 替身/中间层)
+            _GEO_BODY="$out"
+            return 0 ;;
+    esac
+}
+# 记录一个成功源;首个成功源优先,后续来源国家不一致只告警
+_geo_consider() {
+    [ -z "$1" ] && return 0
+    if [ -z "$_GEO_CC" ]; then
+        _GEO_CC="$1"; _GEO_TZ="$2"; _GEO_SRC="$3"
+    elif [ "$1" != "$_GEO_CC" ]; then
+        printf 'WARN:出口国家不一致(%s=%s %s=%s),采用优先级更高的 %s\n' \
+            "$_GEO_SRC" "$_GEO_CC" "$3" "$1" "$_GEO_SRC" >&2
+    fi
+}
+
+# 多源出口探测:ipinfo → ipapi → ifconfig → cloudflare trace,成功源按此优先级取首个;
+# 全部失败输出 "||",各源失败原因写入 GEO_DIAG_FILE(命令替换会丢子 shell 变量)。
+geo_lookup() {
+    local cc tz loc
+    local _GEO_BODY="" _GEO_CC="" _GEO_TZ="" _GEO_SRC=""
+    GEO_DIAG=""
+
+    if _geo_fetch "https://ipinfo.io/json" ipinfo; then
+        cc=$(_geo_json_field "$_GEO_BODY" country)
+        tz=$(_geo_json_field "$_GEO_BODY" timezone)
+        if _geo_valid_country "$cc"; then
+            _geo_valid_tz "$tz" || tz=$(default_tz_for "$cc")
+            _geo_consider "$cc" "$tz" ipinfo
+        else
+            _geo_diag_add "ipinfo 国家字段无效"
+        fi
+    fi
+
+    if _geo_fetch "https://ipapi.co/json/" ipapi; then
+        cc=$(_geo_json_field "$_GEO_BODY" country_code)
+        tz=$(_geo_json_field "$_GEO_BODY" timezone)
+        if _geo_valid_country "$cc"; then
+            _geo_valid_tz "$tz" || tz=$(default_tz_for "$cc")
+            _geo_consider "$cc" "$tz" ipapi
+        else
+            _geo_diag_add "ipapi 国家字段无效"
+        fi
+    fi
+
+    if _geo_fetch "https://ifconfig.co/json" ifconfig; then
+        cc=$(_geo_json_field "$_GEO_BODY" country_iso)
+        tz=$(_geo_json_field "$_GEO_BODY" timezone)
+        if _geo_valid_country "$cc"; then
+            _geo_valid_tz "$tz" || tz=$(default_tz_for "$cc")
+            _geo_consider "$cc" "$tz" ifconfig
+        else
+            _geo_diag_add "ifconfig 国家字段无效"
+        fi
+    fi
+
+    if _geo_fetch "https://www.cloudflare.com/cdn-cgi/trace" cloudflare; then
+        loc=$(printf '%s\n' "$_GEO_BODY" | tr -d '\r' | sed -n 's/^loc=\([A-Za-z][A-Za-z]\)$/\1/p' | head -n 1 | tr 'a-z' 'A-Z')
+        if _geo_valid_country "$loc"; then
+            _geo_consider "$loc" "$(default_tz_for "$loc")" cloudflare
+        else
+            _geo_diag_add "cloudflare loc 无效"
+        fi
+    fi
+
+    if [ -z "$_GEO_CC" ]; then
+        printf '||\n'
+        return 1
+    fi
+    printf '%s|%s|%s\n' "$_GEO_CC" "$_GEO_TZ" "$_GEO_SRC"
+    return 0
+}
+
 # 国家代码 → 地区格式映射(未收录的国家回退 en_US)
 locale_for() {
     case "$1" in
@@ -1045,18 +1167,30 @@ set_client() {
 
 # 地区自适应:按当前出口国家一键重设 国家/时区/地区格式(换了国家节点后运行)
 set_region() {
-    trace=$(curl -s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
-    loc=$(echo "$trace" | grep '^loc=' | cut -d= -f2)
-    [ -z "$loc" ] && { echo "FAIL:无法获取出口国家(cloudflare trace 无结果,请先挂代理)"; return 1; }
-    info=$(curl -s --max-time 8 https://ipinfo.io/json 2>/dev/null)
-    ctry=$(echo "$info" | grep '"country"' | cut -d'"' -f4)
-    ntz=$(echo "$info" | grep '"timezone"' | cut -d'"' -f4)
-    if [ -z "$ctry" ] || [ -z "$ntz" ]; then
-        echo "FAIL:ipinfo 未返回国家或时区"; return 1
+    local geo gfile ctry ntz src nlocale rc
+    gfile=$(mktemp "${TMPDIR:-/tmp}/claude-geo.XXXXXX" 2>/dev/null) || gfile=""
+    GEO_DIAG_FILE="$gfile"
+    geo=$(geo_lookup); rc=$?
+    if [ -n "$gfile" ]; then
+        GEO_DIAG=$(tr '\n' ';' < "$gfile" 2>/dev/null | sed 's/;$//')
+        rm -f "$gfile"
+    else
+        GEO_DIAG=""
     fi
-    if [ "$loc" != "$ctry" ]; then
-        echo "FAIL:出口国家不一致(cloudflare=$loc ipinfo=$ctry),已中止"; return 1
+    unset GEO_DIAG_FILE
+    if [ "$rc" -ne 0 ] || [ -z "$geo" ] || [ "${geo%%|*}" = "" ]; then
+        echo "FAIL:所有出口探测源均失败(${GEO_DIAG:-无诊断信息})"
+        echo "INFO:请确认代理已开启;若代理规则把 ipinfo/ipapi 判直连,可改为手动设置或稍后重试"
+        return 1
     fi
+    ctry=${geo%%|*}; geo=${geo#*|}
+    ntz=${geo%%|*}; src=${geo#*|}
+    if [ "$ctry" = "CN" ]; then
+        echo "FAIL:出口国家为 CN(来源 $src),已中止;请先切换节点再重试"
+        return 1
+    fi
+    [ -n "$ntz" ] || ntz=$(default_tz_for "$ctry")
+    [ "$src" = "cloudflare" ] && echo "INFO:时区使用国家默认(可手动改)"
     nlocale=$(locale_for "$ctry")
 
     # 改写脚本自身头部三个配置项
@@ -1090,7 +1224,7 @@ ASEOF
         sed -i '' "s|^TARGET=.*|TARGET=$ntz|" "$WD" 2>/dev/null || echo "WARN:看门狗目标未同步,请运行安装器刷新"
     fi
 
-    echo "OK:region=$loc tz=$ntz locale=$nlocale"
+    echo "OK:region=$ctry tz=$ntz locale=$nlocale source=$src"
 }
 
 # 自动更新:拉取 main 分支最新代码,SHA256 校验+配置注入+自检+失败回滚
