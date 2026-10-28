@@ -263,7 +263,7 @@ skills/
 
 ## 更换代理客户端（macOS）
 
-安装时选错了客户端、或后来从 Clash Verge 换到 Shadowrocket 等，不需要重装：
+安装时选错了客户端、或后来从 Clash Verge 换到 Shadowrocket 等，可以先更改核心配置；**如果已安装 root 保镖，还必须重新运行安装器同步其模式**（不会由用户态命令直接改写 root 文件）：
 
 ```bash
 ~/.local/bin/claude-switch.sh set-client shadowrocket
@@ -273,7 +273,7 @@ skills/
 
 - 换成 Shadowrocket 后，「代理内核」检查 `scutil --nc` 的连接状态，不再去找 Clash Verge
 - 非 Clash 客户端不做配置改写，「规则置顶」改用 fake-ip 行为检测；不通过时按提示在客户端里手动添加 Claude 域名规则
-- 如果「保镖在线」是红的，再跑一次 `fix`（需要一次管理员授权）安装守护进程
+- 「保镖」现在会核对运行中 LaunchDaemon 与 root 所有的保镖脚本内 `MODE`，不再只看进程是否存在；客户端模式不一致时显示 `fail:客户端不一致`，此时需手动重跑 `installer/安装.command` 同步保镖（需要管理员权限）。`fix` 只能启动缺失的 LaunchDaemon，**不会更新已有 root 脚本内的旧模式**；在重新检查通过前不要启动 Claude。
 
 ## 账号快照加密导出（macOS）
 
